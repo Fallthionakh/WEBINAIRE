@@ -1,59 +1,63 @@
 # 🎥 WEBINAIRE
 
-Plateforme de gestion de webinaires.
+Plateforme de gestion de webinaires pour WOMMAT : planification, diffusion,
+liste de présence automatique et bibliothèque de ressources.
 
-Ce dépôt contient une **première version (prototype front-end)** : elle tourne
-entièrement dans le navigateur, sans serveur, et enregistre les données dans le
-`localStorage`. Elle sert à valider les écrans et le parcours avant de
-construire l'architecture complète décrite plus bas.
+Site : <https://fallthionakh.github.io/WEBINAIRE/>
+
+## Rôles
+
+| Rôle | Ce qu'il peut faire |
+|---|---|
+| 👑 Administrateur | Donne l'accès encadreur (par e-mail), change les rôles, voit et gère tous les webinaires |
+| 🧑‍🏫 Encadreur | Crée, reprogramme et annule ses webinaires ; voit les inscrits et les présents ; exclut ou réintègre un apprenant ; dépose des ressources |
+| 🎓 Apprenant | Crée son compte, s'inscrit à un ou plusieurs webinaires, rejoint le direct, consulte la bibliothèque |
 
 ## Fonctionnalités
 
-| Module | Dans ce prototype |
-|---|---|
-| 👥 Gestion des utilisateurs | Connexion par nom + e-mail, rôles *organisateur* / *participant* |
-| 📅 Planification des webinaires | Création (titre, intervenant, date, durée, places), inscription / désinscription |
-| 🎬 Diffusion en direct | Démarrer / terminer le direct, aperçu caméra de l'organisateur |
-| 💬 Interaction en temps réel | Chat, questions avec votes, sondages (synchronisés entre onglets) |
-| 📊 Analytics & Reporting | Inscriptions, taux de présence, messages, revenus par webinaire |
-| 💰 Monétisation (optionnel) | Prix en FCFA par webinaire, revenus estimés |
+- **Webinaires** : titre, description, date, heure de début, durée et heure de fin (calculées l'une de l'autre), reprogrammation (badge « Reprogrammé »), annulation avec motif.
+- **Salle en direct** : caméra, partage d'écran, présentation PDF ou images (◀ ▶, flèches du clavier, depuis la bibliothèque), plein écran ; chat, questions et sondages en temps réel ; liste des participants en ligne avec bouton « Exclure ».
+- **Liste de présence automatique** : chaque connexion est enregistrée par le serveur (date, heure de connexion, heure de déconnexion, durée), avec le total par apprenant et les absents. Export Excel / CSV.
+- **Bibliothèque** : PDF, vidéos (lecture intégrée), PowerPoint, Word, Excel, images ; 50 Mo par fichier ; ressources liées à un webinaire.
+- Interface responsive (ordinateur et téléphone), mode sombre automatique.
 
-## Lancer l'application
-
-Aucune installation n'est nécessaire : ouvrez `index.html` dans un navigateur.
-
-Pour tester le « temps réel », ouvrez l'application dans deux onglets :
-un organisateur qui démarre le direct, un participant qui écrit dans le chat.
-
-> La caméra ne fonctionne que si la page est servie en `https://` ou depuis
-> `localhost` (par exemple avec GitHub Pages).
-
-## Architecture cible
+## Architecture
 
 ```
-FRONTEND          React.js / Next.js + TypeScript, TailwindCSS,
-                  Socket.io-client, WebRTC, Redux Toolkit / Zustand
-BACKEND           Node.js (Express / NestJS) ou Django,
-                  REST + GraphQL, Socket.io, BullMQ, JWT + OAuth2
-BASES DE DONNÉES  PostgreSQL (données principales), Redis (cache, sessions, pub/sub),
-                  MongoDB (logs, chat, analytics), S3 / MinIO (fichiers, vidéos)
+GitHub Pages (index.html, styles.css, app.js, config.js)
+        │  supabase-js
+        ▼
+Supabase : Auth (comptes) · PostgreSQL + RLS (données et droits)
+           Realtime (chat, sondages, présence) · Storage (bibliothèque)
 ```
 
-## Structure
+Toute la sécurité est appliquée par la base de données (Row Level Security,
+voir [`supabase/schema.sql`](supabase/schema.sql)) : la clé publique présente
+dans `config.js` ne donne que les droits prévus pour chaque rôle. Aucun mot de
+passe n'est stocké dans le code.
 
-```
-index.html   page principale
-styles.css   styles (thème clair / sombre)
-app.js       logique de l'application
-```
+## Installation
+
+1. Créer un projet sur [supabase.com](https://supabase.com) (offre gratuite).
+2. Dans **SQL Editor**, exécuter `supabase/schema.sql`.
+3. Dans **Authentication → Sign In / Providers → Email**, désactiver *Confirm email*
+   (ou configurer un serveur SMTP pour garder la confirmation).
+4. Dans **Authentication → Users → Add user**, créer le compte administrateur
+   `wommatsn@gmail.com` (cocher *Auto Confirm User*). Il reçoit automatiquement le rôle admin.
+5. Dans **Authentication → URL Configuration**, mettre l'adresse du site en *Site URL*.
+6. Copier l'URL du projet et la clé *publishable* (ou *anon*) dans `config.js`.
+
+Pour une présentation PowerPoint pendant le direct, exportez-la d'abord en PDF
+(*Fichier → Exporter → PDF*). Les PDF sont affichés avec
+[pdf.js](https://mozilla.github.io/pdf.js/).
 
 ## Feuille de route
 
-- [x] Prototype front-end (ce dépôt)
-- [ ] Migration vers Next.js + TypeScript + TailwindCSS
-- [ ] API Node.js avec authentification JWT / OAuth2
-- [ ] Base PostgreSQL pour les utilisateurs et les webinaires
-- [ ] Chat et sondages en temps réel avec Socket.io + Redis
-- [ ] Diffusion vidéo WebRTC vers les participants
-- [ ] Enregistrement des replays (S3 / MinIO)
-- [ ] Paiement en ligne des webinaires payants
+- [x] Comptes et rôles (admin, encadreur, apprenant)
+- [x] Planification, reprogrammation, annulation
+- [x] Liste de présence automatique et export
+- [x] Bibliothèque de ressources
+- [ ] Transmission vidéo WebRTC vers les apprenants (LiveKit, Jitsi ou Daily)
+- [ ] Rappels par e-mail avant chaque webinaire (SMTP personnalisé)
+- [ ] Enregistrement des replays dans la bibliothèque
+- [ ] Attestations de présence en PDF
