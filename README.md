@@ -21,7 +21,8 @@ Site : <https://fallthionakh.github.io/WEBINAIRE/>
 - **Ressources des webinaires** : depuis un webinaire, ajouter des ressources de la bibliothèque ou déposer un fichier ; depuis la bibliothèque, « Lier à un webinaire ». Une ressource peut servir à plusieurs webinaires.
 - **Webinaires** : titre, description, date, heure de début, durée et heure de fin (calculées l'une de l'autre), reprogrammation (badge « Reprogrammé »), annulation avec motif.
 - **Visio (Daily)** : son et vidéo pour tous, partage d'écran pour l'encadreur et les apprenants ; l'encadreur (propriétaire de la salle) peut couper les micros et retirer un participant. Salle Daily privée : on n'y entre qu'avec un jeton délivré par la fonction `daily-token`, après vérification de l'inscription. Sans configuration Daily, la salle revient au mode local (caméra, partage d'écran et présentation visibles par l'encadreur seulement).
-- **Salle en direct** : chat, questions et sondages en temps réel ; mains levées ; admission des demandes en attente ; liste des participants en ligne avec bouton « Exclure ».
+- **Salle d’attente** : toute personne connectée qui ouvre le lien de la salle attend d’être admise par l’organisateur (bandeau avec Admettre / Refuser / Tout admettre, notification sonore). Chaque retour (après avoir quitté, rechargé ou été retiré) repasse par la salle d’attente. Un compte pas encore validé par l’admin peut entrer par un lien si l’organisateur l’admet.
+- **Salle en direct** : chat, questions et sondages en temps réel ; mains levées ; liste des participants avec « Retirer » ; « Agrandir » et plein écran pour tous ; « Copier le lien de la salle ».
 - **Liste de présence automatique** : chaque connexion est enregistrée par le serveur (date, heure de connexion, heure de déconnexion, durée), avec le total par apprenant et les absents. Export Excel / CSV.
 - **Bibliothèque** : PDF, vidéos (lecture intégrée), PowerPoint, Word, Excel, images ; 50 Mo par fichier ; ressources liées à un webinaire.
 - Interface responsive (ordinateur et téléphone), mode sombre automatique.
@@ -45,7 +46,7 @@ passe n'est stocké dans le code.
 
 1. Créer un projet sur [supabase.com](https://supabase.com) (offre gratuite).
 2. Dans **SQL Editor**, exécuter dans l'ordre `supabase/schema.sql`, `supabase/002_approbation_connexions.sql`
-   et `supabase/003_inscriptions_ressources.sql`.
+   `supabase/003_inscriptions_ressources.sql` et `supabase/004_salle_attente.sql`.
 3. Dans **Authentication → Sign In / Providers → Email**, désactiver *Confirm email*
    (ou configurer un serveur SMTP pour garder la confirmation).
 4. Dans **Authentication → Users → Add user**, créer le compte administrateur

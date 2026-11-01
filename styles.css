@@ -400,6 +400,12 @@ tr:last-child td { border-bottom: 0; }
 .room { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr) 360px; }
 @media (max-width: 1000px) { .room { grid-template-columns: minmax(0, 1fr); } }
 
+/* « Agrandir » : la vidéo prend toute la largeur, le panneau passe dessous. */
+.room.wide { grid-template-columns: minmax(0, 1fr); }
+.room.wide .stage.video { height: min(86vh, 900px); }
+.room.wide .stage:not(.video) { aspect-ratio: 16 / 9; }
+.stage:fullscreen.video, .stage:-webkit-full-screen { height: 100vh; }
+
 .stage {
   position: relative;
   aspect-ratio: 16 / 9;
@@ -453,6 +459,35 @@ tr:last-child td { border-bottom: 0; }
 .poll-opt .fill { position: absolute; inset: 0 auto 0 0; background: var(--primary-soft); z-index: 0; }
 .poll-opt span { position: relative; z-index: 1; }
 .poll-opt.mine { border-color: var(--primary); }
+
+/* ---------- Agenda (FullCalendar) ---------- */
+
+#agenda {
+  --fc-border-color: var(--border);
+  --fc-page-bg-color: var(--surface);
+  --fc-neutral-bg-color: var(--surface-2);
+  --fc-list-event-hover-bg-color: var(--surface-2);
+  --fc-today-bg-color: var(--primary-soft);
+  --fc-button-bg-color: var(--surface-2);
+  --fc-button-border-color: var(--border);
+  --fc-button-text-color: var(--text);
+  --fc-button-hover-bg-color: var(--primary-soft);
+  --fc-button-hover-border-color: var(--primary);
+  --fc-button-active-bg-color: var(--primary);
+  --fc-button-active-border-color: var(--primary);
+  font-size: .9rem;
+}
+#agenda .fc-button { border-radius: 8px; font-weight: 600; text-transform: none; box-shadow: none; }
+#agenda .fc-button-active { color: #fff; }
+#agenda .fc-toolbar-title { font-size: 1.15rem; font-weight: 700; text-transform: capitalize; }
+#agenda .fc-event { cursor: pointer; border-radius: 6px; }
+#agenda .fc-daygrid-day { cursor: pointer; }
+#agenda .ev-cancelled .fc-event-title, #agenda .ev-cancelled .fc-list-event-title { text-decoration: line-through; }
+#agenda a { color: inherit; }
+@media (max-width: 700px) {
+  #agenda .fc-toolbar { flex-wrap: wrap; gap: 8px; }
+  #agenda .fc-toolbar-title { font-size: 1rem; }
+}
 
 /* ---------- Bibliothèque ---------- */
 

@@ -15,6 +15,7 @@ const HEARTBEAT_MS = 30000;
 const SESSION_PING_MS = 60000;
 const PDFJS_URL = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
 const SITE_URL = location.origin + location.pathname;
+const NEXT_KEY = 'webinaire.next';
 
 let session = null;
 let profile = null;
@@ -111,7 +112,8 @@ function isStaff() {
 }
 
 function translateError(error) {
-  const msg = (error && (error.message || error.error_description)) || String(error || '');
+  const msg = (error && (error.message || error.error_description || error.errorMsg || error.error?.msg)) ||
+    (typeof error === 'string' ? error : 'Erreur inattendue.');
   const map = [
     [/Invalid login credentials/i, 'E-mail ou mot de passe incorrect.'],
     [/already registered|already been registered/i, 'Un compte existe déjà avec cet e-mail.'],
@@ -232,6 +234,7 @@ function dateBox(iso) {
 async function route() {
   const token = ++renderToken;
   await leaveRoom();
+  destroyAgenda();
   closeModal();
   let hash = location.hash || '#/';
   if (/access_token|error=/.test(hash)) hash = '#/';
@@ -239,6 +242,10 @@ async function route() {
   if (!configured) return renderSetup();
 
   if (!session) {
+    // Lien d'invitation (salle ou webinaire) : on y reviendra après la connexion.
+    if (/^#\/(salle|webinaires)\/[\w-]+$/.test(hash)) {
+      try { sessionStorage.setItem(NEXT_KEY, hash); } catch (e) { /* stockage indisponible */ }
+    }
     if (hash === '#/inscription') return renderAuth('signup');
     if (hash === '#/mot-de-passe-oublie') return renderAuth('forgot');
     return renderAuth('login');
@@ -259,7 +266,25 @@ async function route() {
     profile = data;
   }
 
+  let next = null;
+  try {
+    next = sessionStorage.getItem(NEXT_KEY);
+    sessionStorage.removeItem(NEXT_KEY);
+  } catch (e) { /* stockage indisponible */ }
+  if (next && next !== location.hash) {
+    location.hash = next;
+    return;
+  }
+
   startAppSession();
+  if (profile.status === 'en_attente') {
+    // Compte pas encore validé : il peut quand même demander à entrer dans une salle par un lien.
+    const room = hash.match(/^#\/salle\/([\w-]+)$/);
+    if (room) {
+      renderBareShell();
+      return viewRoom(document.getElementById('view'), token, room[1]);
+    }
+  }
   if (profile.status && profile.status !== 'approuve') return renderBlocked();
 
   if (hash === '#/connexion' || hash === '#/inscription') hash = '#/';
@@ -279,6 +304,34 @@ async function route() {
   if (hash === '#/profil') return viewProfile(view, token);
   if (hash === '#/mes-inscriptions' && profile.role === 'apprenant') return viewMyRegistrations(view, token);
   location.hash = '#/';
+}
+
+// Mise en page réduite (sans menu) pour un compte en attente arrivé par un lien de salle.
+function renderBareShell() {
+  app.innerHTML = `
+    <div class="main">
+      <header class="mobile-bar" style="display:flex">
+        <a class="brand" href="#/"><span class="logo">🎥</span>WEBINAIRE</a>
+        <span style="flex:1"></span>
+        <button class="btn ghost sm" id="logout">Déconnexion</button>
+      </header>
+      <main id="view" class="view"></main>
+    </div>`;
+  document.getElementById('logout').addEventListener('click', logout);
+}
+
+function roomLink(id) {
+  return `${SITE_URL}#/salle/${id}`;
+}
+
+async function copyRoomLink(id) {
+  try {
+    await navigator.clipboard.writeText(roomLink(id));
+    toast('Lien de la salle copié ✓ Envoyez-le aux participants.', 'success');
+  } catch (e) {
+    openModal(`<h2>Lien de la salle</h2><input readonly value="${esc(roomLink(id))}" onclick="this.select()">
+      <div class="actions"><button class="btn" data-close>Fermer</button></div>`);
+  }
 }
 
 function renderShell(hash) {
@@ -418,6 +471,8 @@ function renderAuth(mode) {
     forgot: ['Mot de passe oublié', 'Recevez un lien pour choisir un nouveau mot de passe.']
   };
   const [title, subtitle] = titles[mode];
+  let invited = false;
+  try { invited = !!sessionStorage.getItem(NEXT_KEY); } catch (e) { /* stockage indisponible */ }
 
   app.innerHTML = `
     <div class="auth">
@@ -439,6 +494,9 @@ function renderAuth(mode) {
         <div class="auth-card">
           <h2>${title}</h2>
           <p class="muted" style="margin-bottom:24px">${subtitle}</p>
+          ${invited ? `<div class="notice" style="margin-bottom:20px">🎥 Vous avez reçu un lien vers un webinaire.
+            ${mode === 'signup' ? 'Créez votre compte' : 'Connectez-vous (ou créez un compte)'} : vous arriverez ensuite
+            dans la salle d’attente, et l’organisateur vous admettra.</div>` : ''}
           <form id="auth-form" class="form">
             ${mode === 'signup' ? '<label>Nom complet<input name="full_name" required maxlength="80" autocomplete="name"></label>' : ''}
             <label>E-mail<input name="email" type="email" required autocomplete="email"></label>
@@ -641,7 +699,7 @@ function webinarCard(w, { reg = null, pending = 0, showActions = false } = {}) {
   const inscrits = w.registrations ? (w.registrations[0]?.count || 0) : null;
   const open = ['planifie', 'en_direct'].includes(w.status);
   let action = `<a class="btn sm" href="#/webinaires/${w.id}">Détails</a>`;
-  if (w.status === 'en_direct' && (canManage(w) || reg?.status === 'approuve')) {
+  if (w.status === 'en_direct' && (canManage(w) || reg?.status !== 'suspendu')) {
     action = `<a class="btn live sm" href="#/salle/${w.id}">Rejoindre</a>`;
   } else if (showActions && profile.role === 'apprenant' && open && reg?.status !== 'suspendu') {
     action = reg
@@ -703,7 +761,8 @@ async function viewWebinars(view, token) {
         `<button class="chip ${k === filter ? 'active' : ''}" data-filter="${k}">${l}</button>`).join('')}</div>
       <input class="search" id="search" type="search" placeholder="Rechercher un webinaire…">
     </div>
-    <div id="results"></div>`;
+    <div id="results"></div>
+    <div id="agenda-card"></div>`;
 
   const draw = () => {
     const now = new Date().toISOString();
@@ -735,6 +794,161 @@ async function viewWebinars(view, token) {
     draw();
   });
   view.querySelector('#search').addEventListener('input', e => { search = e.target.value.trim().toLowerCase(); draw(); });
+
+  // Agenda : l'encadreur voit ses webinaires, l'admin tous ; l'apprenant ne voit que
+  // les webinaires auxquels son inscription est approuvée (pas d'agenda s'il n'en a aucun).
+  const agendaItems = profile.role === 'apprenant'
+    ? webinars.filter(w => regMap.get(w.id)?.status === 'approuve')
+    : webinars;
+  if (agendaItems.length || isStaff()) renderAgenda(view.querySelector('#agenda-card'), agendaItems, token);
+}
+
+// =====================================================================
+// Agenda (FullCalendar) : jour, semaine, mois, liste ; glisser pour reprogrammer
+// =====================================================================
+
+const FULLCALENDAR_URL = 'https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js';
+const FULLCALENDAR_FR_URL = 'https://cdn.jsdelivr.net/npm/@fullcalendar/core@6.1.15/locales/fr.global.min.js';
+let fullCalendarPromise = null;
+let agendaCalendar = null;
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = src;
+    script.onload = resolve;
+    script.onerror = () => reject(new Error(`Impossible de charger ${src}`));
+    document.head.append(script);
+  });
+}
+
+function loadFullCalendar() {
+  if (!fullCalendarPromise) {
+    fullCalendarPromise = loadScript(FULLCALENDAR_URL)
+      .then(() => loadScript(FULLCALENDAR_FR_URL))
+      .then(() => window.FullCalendar)
+      .catch(err => { fullCalendarPromise = null; throw err; });
+  }
+  return fullCalendarPromise;
+}
+
+function destroyAgenda() {
+  if (agendaCalendar) {
+    agendaCalendar.destroy();
+    agendaCalendar = null;
+  }
+}
+
+const AGENDA_COLORS = { planifie: '#4f46e5', en_direct: '#e11d48', termine: '#6b7280', annule: '#9ca3af' };
+
+function agendaEvent(w) {
+  return {
+    id: w.id,
+    title: w.title,
+    start: w.starts_at,
+    end: w.ends_at,
+    color: AGENDA_COLORS[w.status],
+    classNames: w.status === 'annule' ? ['ev-cancelled'] : [],
+    // Seul l'organisateur peut déplacer un webinaire encore planifié.
+    editable: canManage(w) && w.status === 'planifie',
+    durationEditable: false,
+    extendedProps: { webinar: w }
+  };
+}
+
+async function renderAgenda(box, items, token) {
+  box.innerHTML = `
+    <div class="card" style="margin-top:24px">
+      <div class="row spread" style="margin-bottom:12px">
+        <h2 style="margin:0">📅 Agenda</h2>
+        ${isStaff() ? '<span class="muted small">Glissez un webinaire planifié pour le reprogrammer.</span>' : ''}
+      </div>
+      <div id="agenda">${loading('Chargement de l’agenda…')}</div>
+    </div>`;
+  let FC;
+  try {
+    FC = await loadFullCalendar();
+  } catch (err) {
+    if (!isStale(token)) box.querySelector('#agenda').innerHTML = `<div class="notice danger">${esc(err.message)}</div>`;
+    return;
+  }
+  if (isStale(token)) return;
+  const el = box.querySelector('#agenda');
+  el.innerHTML = '';
+  destroyAgenda();
+  const narrow = window.matchMedia('(max-width: 700px)').matches;
+  agendaCalendar = new FC.Calendar(el, {
+    locale: 'fr',
+    initialView: narrow ? 'listWeek' : 'dayGridMonth',
+    headerToolbar: narrow
+      ? { left: 'prev,next', center: 'title', right: 'today' }
+      : { left: 'prev,next today', center: 'title', right: 'timeGridDay,timeGridWeek,dayGridMonth,listMonth' },
+    footerToolbar: narrow ? { center: 'timeGridDay,listWeek,dayGridMonth' } : false,
+    buttonText: { listMonth: 'Liste', listWeek: 'Semaine' },
+    height: 'auto',
+    nowIndicator: true,
+    slotMinTime: '06:00:00',
+    slotMaxTime: '23:00:00',
+    allDaySlot: false,
+    eventTimeFormat: { hour: '2-digit', minute: '2-digit' },
+    noEventsText: 'Aucun webinaire sur cette période.',
+    events: items.map(agendaEvent),
+    // Ouvrir une date : la liste des webinaires de ce jour.
+    dateClick: info => agendaCalendar.changeView('listDay', info.dateStr),
+    navLinks: true,
+    navLinkDayClick: date => agendaCalendar.changeView('listDay', date),
+    eventClick: info => {
+      info.jsEvent.preventDefault();
+      agendaDetails(info.event.extendedProps.webinar);
+    },
+    eventDrop: info => agendaReschedule(info)
+  });
+  agendaCalendar.render();
+}
+
+// Détails d'un webinaire depuis l'agenda.
+function agendaDetails(w) {
+  const live = w.status === 'en_direct';
+  openModal(`
+    <div class="row spread"><div class="row">${statusBadge(w)}</div><button class="btn ghost" data-close aria-label="Fermer">✕</button></div>
+    <h2 style="margin:0">${esc(w.title)}</h2>
+    <div class="info-grid">
+      <div><div class="k">Date</div><div class="v">${esc(fmtDate(w.starts_at))}</div></div>
+      <div><div class="k">Horaire</div><div class="v">${esc(fmtTime(w.starts_at))} – ${esc(fmtTime(w.ends_at))}</div></div>
+      <div><div class="k">Durée</div><div class="v">${esc(fmtMinutes(w.duration_minutes))}</div></div>
+      <div><div class="k">Encadreur</div><div class="v">${esc(w.encadreur?.full_name || '')}</div></div>
+    </div>
+    ${w.description ? `<p class="muted" style="white-space:pre-line">${esc(w.description)}</p>` : ''}
+    ${w.status === 'annule' && w.cancel_reason ? `<div class="notice danger">Annulé : ${esc(w.cancel_reason)}</div>` : ''}
+    <div class="actions">
+      ${canManage(w) && w.status === 'planifie' ? `<a class="btn" href="#/webinaires/${w.id}/reprogrammer" data-close>🗓️ Reprogrammer</a>` : ''}
+      <a class="btn ${live ? '' : 'primary'}" href="#/webinaires/${w.id}" data-close>Voir le webinaire</a>
+      ${live ? `<a class="btn live" href="#/salle/${w.id}" data-close>Rejoindre</a>` : ''}
+    </div>`);
+}
+
+// Glisser-déposer : reprogrammer en gardant la même durée.
+async function agendaReschedule(info) {
+  const w = info.event.extendedProps.webinar;
+  const start = info.event.start;
+  if (start < new Date()) {
+    info.revert();
+    return toast('Impossible de reprogrammer dans le passé.', 'error');
+  }
+  const ok = await confirmDialog(`Reprogrammer « ${w.title} » au ${fmtDate(start.toISOString())} à ${fmtTime(start.toISOString())} ?`, {
+    confirmLabel: 'Reprogrammer'
+  });
+  if (!ok) return info.revert();
+  const { data, error } = await sb.from('webinars').update({ starts_at: start.toISOString() })
+    .eq('id', w.id).select().single();
+  if (error) {
+    info.revert();
+    return fail(error);
+  }
+  Object.assign(w, data);
+  info.event.setExtendedProp('webinar', w);
+  info.event.setEnd(data.ends_at);
+  toast('Webinaire reprogrammé ✓ Les inscrits verront la nouvelle date.', 'success');
 }
 
 // Boutons des cartes : « S'inscrire », « Se désinscrire » et demandes à valider.
@@ -1030,10 +1244,12 @@ async function viewWebinarDetail(view, token, id) {
     if (w.status === 'planifie') {
       actions = `
         <a class="btn live" href="#/salle/${id}">🎬 Ouvrir la salle</a>
+        <button class="btn" id="copy-link-w">🔗 Copier le lien</button>
         <a class="btn" href="#/webinaires/${id}/reprogrammer">🗓️ Reprogrammer</a>
         <button class="btn danger" id="cancel-w">Annuler le webinaire</button>`;
     } else if (w.status === 'en_direct') {
-      actions = `<a class="btn live" href="#/salle/${id}">Rejoindre la salle</a>`;
+      actions = `<a class="btn live" href="#/salle/${id}">Rejoindre la salle</a>
+        <button class="btn" id="copy-link-w">🔗 Copier le lien</button>`;
     } else if (w.status === 'termine') {
       actions = `<button class="btn live" id="reopen-w">🔓 Rouvrir le direct</button>
         <a class="btn" href="#/webinaires/${id}/reprogrammer">🗓️ Reprogrammer</a>`;
@@ -1044,7 +1260,7 @@ async function viewWebinarDetail(view, token, id) {
   } else if (profile.role === 'apprenant') {
     if (reg?.status === 'suspendu') {
       actions = '<span class="badge cancel">Votre inscription est suspendue</span>';
-    } else if (w.status === 'en_direct' && reg?.status === 'approuve') {
+    } else if (w.status === 'en_direct') {
       actions = `<a class="btn live" href="#/salle/${id}">Rejoindre le direct</a>`;
     } else if (open && reg) {
       actions = `${regBadge(reg.status)}<button class="btn sm" id="unreg">Se désinscrire</button>`;
@@ -1116,6 +1332,7 @@ async function viewWebinarDetail(view, token, id) {
     route();
   });
   on('#reopen-w', () => reopenWebinar(w));
+  on('#copy-link-w', () => copyRoomLink(id));
   on('#restore-w', async () => {
     const { error: err } = await sb.from('webinars').update({ status: 'planifie', cancel_reason: null }).eq('id', id);
     if (err) return fail(err);
@@ -1298,7 +1515,8 @@ function emptyRoom() {
   return {
     id: null, webinar: null, isHost: false, channel: null, sessionId: null, heartbeat: null,
     tab: 'chat', messages: [], polls: [], votes: [], presence: {},
-    joinedAt: null, hand: false, handAt: null, handsSeen: new Set(), pendingRegs: [],
+    joinedAt: null, hand: false, handAt: null, handsSeen: new Set(),
+    lobby: 'admis', lobbyList: [], lobbySeen: new Set(), lobbyError: '', wide: false,
     video: null, call: null, videoError: ''
   };
 }
@@ -1328,6 +1546,7 @@ function loadDaily() {
 // Si la visio n'est pas configurée, la salle revient au mode local (caméra de l'encadreur).
 async function startVideo() {
   if (room.call || room.video === 'pending' || room.webinar?.status !== 'en_direct') return;
+  if (!room.isHost && room.lobby !== 'admis') return;
   const id = room.id;
   room.video = 'pending';
   let auth;
@@ -1358,12 +1577,25 @@ async function startVideo() {
     lang: 'fr'
   });
   room.video = 'on';
-  room.call.on('error', e => toast(`Visio : ${e?.errorMsg || 'erreur'}`, 'error'));
+  room.call.on('error', e => videoFailed(id, e?.errorMsg || e?.error?.type));
   try {
     await room.call.join({ url: auth.url, token: auth.token });
   } catch (err) {
-    fail(err);
+    videoFailed(id, err?.errorMsg || err?.error?.type || err?.message);
   }
+}
+
+// Erreur Daily (compte, réseau…) : on ferme la visio et on revient au mode local,
+// sans laisser l'écran d'erreur de Daily (dont le lien mène à son espace d'administration).
+function videoFailed(id, code) {
+  if (room.id !== id || room.video === 'off') return;
+  console.warn('Erreur Daily :', code);
+  stopVideo();
+  room.video = 'off';
+  room.videoError = /payment/i.test(code || '')
+    ? 'le compte Daily doit avoir un moyen de paiement enregistré : Daily → Billing'
+    : (code || 'erreur inconnue');
+  renderRoomView();
 }
 
 function stopVideo() {
@@ -1401,7 +1633,8 @@ async function pickSupport() {
 
 // Ma présence dans la salle (nom, rôle, main levée), visible des autres en temps réel.
 function trackMe() {
-  if (!room.channel) return;
+  // Seules les personnes admises apparaissent dans la liste des participants.
+  if (!room.channel || (!room.isHost && room.lobby !== 'admis')) return;
   room.channel.track({
     user_id: profile.id, name: profile.full_name, role: profile.role,
     joined_at: room.joinedAt, hand: room.hand, hand_at: room.handAt
@@ -1425,17 +1658,165 @@ function renderHandBar() {
   bar.querySelector('#hand-toggle').addEventListener('click', () => setHand(!room.hand));
 }
 
-// Demandes d'inscription en attente, admissibles depuis la salle (encadreur).
-async function loadPendingRegs() {
+// =====================================================================
+// Salle d'attente : chaque entrée doit être admise par l'organisateur
+// =====================================================================
+
+// Organisateur : personnes qui attendent d'entrer.
+async function loadLobby() {
   if (!room.isHost) return;
   const id = room.id;
-  const { data } = await sb.from('registrations')
-    .select('apprenant_id, registered_at, apprenant:profiles!apprenant_id(full_name, email)')
-    .eq('webinar_id', id).eq('status', 'en_attente').order('registered_at');
+  const { data } = await sb.from('lobby')
+    .select('user_id, requested_at, user:profiles!user_id(full_name, email, status)')
+    .eq('webinar_id', id).eq('status', 'en_attente').order('requested_at');
   if (room.id !== id) return;
-  room.pendingRegs = data || [];
+  room.lobbyList = data || [];
+  // Signal sonore et notification pour chaque nouvelle arrivée.
+  const fresh = room.lobbyList.filter(r => !room.lobbySeen.has(r.user_id));
+  if (fresh.length) {
+    fresh.forEach(r => toast(`🔔 ${r.user?.full_name || r.user?.email} attend dans la salle d’attente`));
+    beep();
+  }
+  room.lobbySeen = new Set(room.lobbyList.map(r => r.user_id));
   renderRoomMeta();
+  renderLobbyBar();
   if (room.tab === 'participants') renderPanel();
+}
+
+function beep() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.frequency.value = 880;
+    gain.gain.setValueAtTime(0.15, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.4);
+  } catch (e) { /* son indisponible */ }
+}
+
+async function lobbyDecide(userId, decision) {
+  const { error } = await sb.rpc('lobby_decide', { w: room.id, target: userId, decision });
+  if (error) { fail(error); return false; }
+  return true;
+}
+
+// Bandeau de la salle d'attente, toujours visible pour l'organisateur pendant le cours.
+function renderLobbyBar() {
+  const bar = document.getElementById('lobby-bar');
+  if (!bar) return;
+  const list = room.lobbyList;
+  if (!list.length) { bar.innerHTML = ''; return; }
+  bar.innerHTML = `
+    <div class="notice warn">
+      <div class="row spread" style="margin-bottom:8px">
+        <strong>🔔 Salle d’attente : ${list.length} personne${list.length > 1 ? 's' : ''}</strong>
+        ${list.length > 1 ? '<button class="btn primary sm" id="admit-all">✓ Tout admettre</button>' : ''}
+      </div>
+      <div class="list">${list.map(r => `
+        <div class="list-item" style="color:var(--text)">
+          <div class="avatar sm">${esc(initials(r.user?.full_name || r.user?.email))}</div>
+          <div class="grow"><strong>${esc(r.user?.full_name || '—')}</strong>
+            <div class="muted small">${esc(r.user?.email || '')} · depuis ${esc(fmtTime(r.requested_at))}${
+              r.user?.status === 'en_attente' ? ' · compte non validé' : ''}</div></div>
+          <button class="btn primary sm" data-lobby="admis" data-user="${r.user_id}">Admettre</button>
+          <button class="btn ghost sm" data-lobby="refuse" data-user="${r.user_id}">Refuser</button>
+        </div>`).join('')}</div>
+    </div>`;
+  bar.querySelectorAll('[data-lobby]').forEach(b => b.addEventListener('click', async () => {
+    b.disabled = true;
+    if (await lobbyDecide(b.dataset.user, b.dataset.lobby)) {
+      toast(b.dataset.lobby === 'admis' ? 'Participant admis ✓' : 'Demande refusée.', 'success');
+      loadLobby();
+    } else {
+      b.disabled = false;
+    }
+  }));
+  const all = bar.querySelector('#admit-all');
+  if (all) all.addEventListener('click', async () => {
+    all.disabled = true;
+    for (const r of list) await lobbyDecide(r.user_id, 'admis');
+    toast(`${list.length} participants admis ✓`, 'success');
+    loadLobby();
+  });
+}
+
+// Participant : écran de la salle d'attente (en attente, refusé, retiré).
+function renderLobbyWait() {
+  const view = document.getElementById('view');
+  const w = room.webinar;
+  const state = room.lobby;
+  const screens = {
+    en_attente: ['⏳', 'Vous êtes dans la salle d’attente',
+      'L’organisateur a été prévenu et va vous admettre. Restez sur cette page.', ''],
+    refuse: ['🚫', 'Votre demande n’a pas été acceptée',
+      'L’organisateur n’a pas admis votre demande pour le moment.', 'Redemander à entrer'],
+    exclu: ['🚪', 'Vous avez été retiré de la salle',
+      'L’organisateur vous a retiré du cours. Vous pouvez demander à revenir.', 'Demander à revenir']
+  };
+  const [icon, title, text, retry] = screens[state] || screens.en_attente;
+  view.innerHTML = `
+    <div class="card" style="max-width:560px;margin:24px auto;text-align:center">
+      <div style="font-size:2.6rem">${icon}</div>
+      <h2>${title}</h2>
+      <p class="muted">${text}</p>
+      <div class="notice" style="margin:16px 0;text-align:left">
+        <strong>${esc(w.title)}</strong><br>
+        <span class="small">🧑‍🏫 ${esc(w.encadreur?.full_name || '')} · ${esc(fmtDate(w.starts_at))}, ${esc(fmtTime(w.starts_at))}</span>
+      </div>
+      ${state === 'en_attente' ? `<div class="loading" style="padding:8px"><span class="spinner"></span>En attente de l’organisateur…</div>` : ''}
+      <div class="row" style="justify-content:center;margin-top:8px">
+        ${retry ? `<button class="btn primary" id="knock-again">${retry}</button>` : ''}
+        <a class="btn" href="#/">Quitter</a>
+      </div>
+    </div>`;
+  const again = document.getElementById('knock-again');
+  if (again) again.addEventListener('click', async () => {
+    again.disabled = true;
+    const { data, error } = await sb.rpc('lobby_knock', { w: room.id });
+    if (error) { again.disabled = false; return fail(error); }
+    room.lobby = data;
+    renderRoomView();
+  });
+}
+
+// Participant admis : chargement du chat et des sondages, présence, visio.
+async function onAdmitted() {
+  const id = room.id;
+  room.lobby = 'admis';
+  const [msgs, polls] = await Promise.all([
+    sb.from('messages').select('*').eq('webinar_id', id).order('created_at').limit(500),
+    sb.from('polls').select('*').eq('webinar_id', id).order('created_at')
+  ]);
+  if (room.id !== id) return;
+  room.messages = msgs.data || [];
+  room.polls = polls.data || [];
+  if (room.polls.length) {
+    const { data } = await sb.from('poll_votes').select('*').in('poll_id', room.polls.map(p => p.id));
+    room.votes = data || [];
+  }
+  if (room.id !== id) return;
+  room.joinedAt = new Date().toISOString();
+  trackMe();
+  renderRoomView();
+  if (room.webinar.status === 'en_direct') {
+    startAttendance();
+    startVideo();
+  }
+}
+
+// Participant retiré (exclusion, refus) : on coupe tout et on revient à l'écran d'attente.
+function removedFromRoom(state, message) {
+  if (room.isHost || room.lobby === state) return;
+  stopAttendance();
+  stopVideo();
+  if (room.channel) room.channel.untrack();
+  room.lobby = state;
+  room.hand = false;
+  if (message) toast(message, 'error');
+  renderRoomView();
 }
 
 let room = emptyRoom();
@@ -1451,38 +1832,20 @@ let pdfjsPromise = null;
 let stageToken = 0;
 
 async function viewRoom(view, token, id) {
+  // Chaque entrée passe par la salle d'attente (l'organisateur, lui, est admis d'office).
+  const { data: knock, error: knockError } = await sb.rpc('lobby_knock', { w: id });
+  if (isStale(token)) return;
+  if (knockError) {
+    view.innerHTML = `<div class="card">${emptyState('🔒', translateError(knockError),
+      '<a class="btn primary" href="#/">Retour à l’accueil</a>')}</div>`;
+    return;
+  }
   const { data: w, error } = await sb.from('webinars').select(WEBINAR_SELECT).eq('id', id).maybeSingle();
   if (isStale(token)) return;
   if (error || !w) return (view.innerHTML = '<div class="notice danger">Webinaire introuvable.</div>');
 
   const isHost = canManage(w);
-  if (!isHost) {
-    const { data: reg } = await sb.from('registrations').select('status')
-      .eq('webinar_id', id).eq('apprenant_id', profile.id).maybeSingle();
-    if (isStale(token)) return;
-    if (reg?.status !== 'approuve') {
-      const message = !reg ? 'Inscrivez-vous à ce webinaire pour accéder à la salle.'
-        : reg.status === 'en_attente' ? 'Votre inscription attend la validation de l’encadreur.'
-        : 'Votre inscription à ce webinaire est suspendue.';
-      view.innerHTML = `<div class="card">${emptyState('🔒', message,
-        `<a class="btn primary" href="#/webinaires/${id}">Voir le webinaire</a>`)}</div>`;
-      return;
-    }
-  }
-
-  room = { ...emptyRoom(), id, webinar: w, isHost, joinedAt: new Date().toISOString() };
-
-  const [msgs, polls] = await Promise.all([
-    sb.from('messages').select('*').eq('webinar_id', id).order('created_at').limit(500),
-    sb.from('polls').select('*').eq('webinar_id', id).order('created_at')
-  ]);
-  room.messages = msgs.data || [];
-  room.polls = polls.data || [];
-  if (room.polls.length) {
-    const { data } = await sb.from('poll_votes').select('*').in('poll_id', room.polls.map(p => p.id));
-    room.votes = data || [];
-  }
-  if (isStale(token) || room.id !== id) return;
+  room = { ...emptyRoom(), id, webinar: w, isHost, joinedAt: new Date().toISOString(), lobby: isHost ? 'admis' : knock };
 
   const channel = sb.channel(`salle:${id}`, { config: { presence: { key: profile.id } } });
   room.channel = channel;
@@ -1526,26 +1889,44 @@ async function viewRoom(view, token, id) {
     })
     .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'registrations',
       filter: `apprenant_id=eq.${profile.id}` }, p => {
-      if (p.new.webinar_id === id && p.new.status !== 'approuve') kickOut("L'encadreur a suspendu votre inscription à ce webinaire.");
+      if (p.new.webinar_id === id && p.new.status === 'suspendu') {
+        removedFromRoom('exclu', "L'organisateur a suspendu votre inscription à ce webinaire.");
+      }
     });
   if (isHost) {
-    // Nouvelles demandes d'inscription pendant le direct.
-    channel.on('postgres_changes', { event: '*', schema: 'public', table: 'registrations',
-      filter: `webinar_id=eq.${id}` }, () => loadPendingRegs());
+    // Arrivées dans la salle d'attente, en temps réel.
+    channel.on('postgres_changes', { event: '*', schema: 'public', table: 'lobby',
+      filter: `webinar_id=eq.${id}` }, () => loadLobby());
+  } else {
+    // Décision de l'organisateur sur ma demande.
+    channel.on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'lobby',
+      filter: `user_id=eq.${profile.id}` }, p => {
+      if (p.new.webinar_id !== id) return;
+      if (p.new.status === 'admis' && room.lobby !== 'admis') {
+        toast('Vous avez été admis dans la salle ✓', 'success');
+        onAdmitted();
+      } else if (p.new.status === 'refuse') {
+        removedFromRoom('refuse');
+      } else if (p.new.status === 'exclu') {
+        removedFromRoom('exclu', 'L’organisateur vous a retiré de la salle.');
+      }
+    });
   }
   channel.subscribe(status => {
     if (status === 'SUBSCRIBED') trackMe();
   });
 
-  await loadPendingRegs();
-  if (w.status === 'en_direct' && !isHost) await startAttendance();
   if (isStale(token) || room.id !== id) return;
-  renderRoomView();
-  startVideo();
+  if (isHost) {
+    await onAdmitted();
+    await loadLobby();
+  } else {
+    renderRoomView();
+  }
 }
 
 async function startAttendance() {
-  if (room.sessionId || room.isHost) return;
+  if (room.sessionId || room.isHost || room.lobby !== 'admis') return;
   const id = room.id;
   const { data, error } = await sb.rpc('attendance_join', { w: id });
   if (room.id !== id) {
@@ -1556,7 +1937,7 @@ async function startAttendance() {
   room.sessionId = data;
   room.heartbeat = setInterval(async () => {
     const { data: ok, error: err } = await sb.rpc('attendance_ping', { session_id: room.sessionId });
-    if (!err && ok === false) kickOut('Vous ne pouvez plus participer à ce webinaire.');
+    if (!err && ok === false) removedFromRoom('exclu', 'Vous ne pouvez plus participer à ce webinaire.');
   }, HEARTBEAT_MS);
 }
 
@@ -1569,6 +1950,8 @@ function stopAttendance() {
 
 async function leaveRoom() {
   if (!room.id) return;
+  // En quittant, on sort de la salle d'attente : pour revenir, il faudra être admis à nouveau.
+  if (!room.isHost) sb.rpc('lobby_leave', { w: room.id });
   stopAttendance();
   stopVideo();
   if (room.channel) await sb.removeChannel(room.channel);
@@ -1585,6 +1968,7 @@ function kickOut(message) {
 // Fermeture de l'onglet : on enregistre l'heure de départ sans attendre la réponse.
 window.addEventListener('pagehide', () => {
   if (room.sessionId) keepaliveRpc('attendance_leave', { session_id: room.sessionId });
+  if (room.id && !room.isHost) keepaliveRpc('lobby_leave', { w: room.id });
   if (appSession.id) keepaliveRpc('session_end', { sid: appSession.id });
 });
 
@@ -1613,7 +1997,7 @@ function onlineList() {
 
 function participantsLabel() {
   const hands = onlineList().filter(p => p.hand).length;
-  return `👥 ${onlineList().length}${hands ? ` · ✋ ${hands}` : ''}${room.pendingRegs.length ? ` · ⏳ ${room.pendingRegs.length}` : ''}`;
+  return `👥 ${onlineList().length}${hands ? ` · ✋ ${hands}` : ''}${room.lobbyList.length ? ` · 🔔 ${room.lobbyList.length}` : ''}`;
 }
 
 function renderRoomMeta() {
@@ -1630,10 +2014,14 @@ function renderRoomView() {
   if (!view || !w) return;
   const host = room.isHost;
 
+  // Participant pas (encore) admis : écran de la salle d'attente.
+  if (!host && room.lobby !== 'admis') return renderLobbyWait();
+
   // Visio en cours : on ne reconstruit pas la page, sinon la visio serait coupée.
   if (room.call && w.status === 'en_direct' && document.getElementById('video-stage')) {
     renderRoomMeta();
     renderHandBar();
+    renderLobbyBar();
     renderPanel();
     return;
   }
@@ -1672,9 +2060,15 @@ function renderRoomView() {
         <h1>${esc(w.title)}</h1>
       </div>
     </div>
-    <div class="room">
+    ${host ? '<div id="lobby-bar" style="margin-bottom:12px"></div>' : ''}
+    <div class="room${room.wide ? ' wide' : ''}">
       <section>
         <div class="stage${videoMode ? ' video' : ''}">${stage}</div>
+        <div class="stage-tools">
+          <button class="btn sm" id="zoom-wide">${room.wide ? '↙ Réduire' : '↗ Agrandir'}</button>
+          <button class="btn sm" id="zoom-full">⛶ Plein écran</button>
+          ${host ? '<button class="btn sm" id="copy-link">🔗 Copier le lien de la salle</button>' : ''}
+        </div>
         ${host ? stageToolbar(w) : ''}
         ${!host && w.status === 'en_direct' ? '<div class="stage-tools" id="hand-bar"></div>' : ''}
       </section>
@@ -1692,8 +2086,29 @@ function renderRoomView() {
     renderPanel();
   }));
   if (host) bindStageToolbar(w);
+  bindZoomButtons(view, w);
   renderHandBar();
+  renderLobbyBar();
   renderPanel();
+}
+
+// Agrandir la vidéo (masque le panneau latéral) ou la passer en plein écran.
+// On modifie les classes sans reconstruire la page, pour ne pas couper la visio.
+function bindZoomButtons(view, w) {
+  const wide = view.querySelector('#zoom-wide');
+  wide.addEventListener('click', () => {
+    room.wide = !room.wide;
+    view.querySelector('.room').classList.toggle('wide', room.wide);
+    wide.textContent = room.wide ? '↙ Réduire' : '↗ Agrandir';
+  });
+  view.querySelector('#zoom-full').addEventListener('click', () => {
+    const stage = view.querySelector('.stage');
+    const request = stage.requestFullscreen || stage.webkitRequestFullscreen;
+    if (request) request.call(stage);
+    else toast('Le plein écran n’est pas disponible sur cet appareil : utilisez « Agrandir ».');
+  });
+  const copy = view.querySelector('#copy-link');
+  if (copy) copy.addEventListener('click', () => copyRoomLink(w.id));
 }
 
 function stageToolbar(w) {
@@ -1709,7 +2124,6 @@ function stageToolbar(w) {
     return `
       <div class="stage-tools">
         <button class="btn" id="support-open">📚 Ouvrir un support à partager</button>
-        <button class="btn" id="fullscreen">⛶ Plein écran</button>
         <button class="btn danger" id="end-live">Terminer le direct</button>
       </div>
       <p class="hint" style="margin-top:8px">Dans la visio : caméra, micro, <strong>Partager l’écran</strong>,
@@ -1725,7 +2139,6 @@ function stageToolbar(w) {
         <input type="file" id="slides-input" accept="application/pdf,image/*" multiple hidden>
       </label>
       <button class="btn" id="slides-library">📚 Depuis la bibliothèque</button>
-      <button class="btn" id="fullscreen">⛶ Plein écran</button>
       <button class="btn danger" id="end-live">Terminer le direct</button>
     </div>
     ${slides ? `
@@ -1791,15 +2204,8 @@ function renderPanel() {
       (b.hand ? 1 : 0) - (a.hand ? 1 : 0) || (a.hand_at || '').localeCompare(b.hand_at || ''));
     const hands = people.filter(p => p.hand).length;
     panel.innerHTML = `<div class="messages">
-      ${room.pendingRegs.length ? `
-        <div class="notice warn"><strong>⏳ En attente d’admission (${room.pendingRegs.length})</strong>
-          <div class="list">${room.pendingRegs.map(r => `
-            <div class="list-item">
-              <div class="avatar sm">${esc(initials(r.apprenant?.full_name))}</div>
-              <div class="grow" style="color:var(--text)">${esc(r.apprenant?.full_name)}</div>
-              <button class="btn primary sm" data-admit="${r.apprenant_id}">Admettre</button>
-              <button class="btn ghost sm" data-refuse="${r.apprenant_id}">Refuser</button>
-            </div>`).join('')}</div></div>` : ''}
+      ${room.lobbyList.length ? `<div class="notice warn">🔔 ${room.lobbyList.length} personne${room.lobbyList.length > 1 ? 's' : ''}
+        dans la salle d’attente : admettez-les dans le bandeau au-dessus de la vidéo.</div>` : ''}
       <div class="muted small">En ligne : ${people.length}${hands ? ` · ✋ ${hands} main${hands > 1 ? 's' : ''} levée${hands > 1 ? 's' : ''}` : ''}</div>
       ${people.length ? `<div class="list">${people.map(p => `
         <div class="list-item">
@@ -1811,20 +2217,17 @@ function renderPanel() {
           ${p.role === 'apprenant' ? `<button class="btn danger sm" data-kick="${p.user_id}">Exclure</button>` : ''}
         </div>`).join('')}</div>` : emptyState('👥', 'Personne en ligne pour le moment.')}
     </div>`;
-    panel.querySelectorAll('[data-kick]').forEach(b => b.addEventListener('click', () =>
-      setRegistrationStatus(w.id, b.dataset.kick, 'suspendu')));
+    panel.querySelectorAll('[data-kick]').forEach(b => b.addEventListener('click', async () => {
+      const person = people.find(p => p.user_id === b.dataset.kick);
+      if (!await confirmDialog(`Retirer ${person?.name || 'ce participant'} de la salle ?`, {
+        confirmLabel: 'Retirer', danger: true
+      })) return;
+      if (await lobbyDecide(b.dataset.kick, 'exclu')) {
+        toast('Participant retiré. S’il revient, il passera par la salle d’attente.', 'success');
+      }
+    }));
     panel.querySelectorAll('[data-lower]').forEach(b => b.addEventListener('click', () =>
       room.channel.send({ type: 'broadcast', event: 'lower-hand', payload: { user_id: b.dataset.lower } })));
-    panel.querySelectorAll('[data-admit], [data-refuse]').forEach(b => b.addEventListener('click', async () => {
-      const status = b.dataset.admit ? 'approuve' : 'suspendu';
-      const userId = b.dataset.admit || b.dataset.refuse;
-      b.disabled = true;
-      const { error } = await sb.from('registrations').update({ status })
-        .eq('webinar_id', w.id).eq('apprenant_id', userId);
-      if (error) { b.disabled = false; return fail(error); }
-      toast(status === 'approuve' ? 'Apprenant admis ✓ Il peut entrer dans la salle.' : 'Demande refusée.', 'success');
-      loadPendingRegs();
-    }));
     return;
   }
 
