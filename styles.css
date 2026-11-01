@@ -151,6 +151,37 @@ input, textarea, select {
 }
 .stage video { width: 100%; height: 100%; object-fit: cover; }
 
+.stage-host {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.stage-host > video,
+.stage-host > img,
+.stage-host > canvas {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.stage-host > video:first-child { object-fit: cover; }
+.stage-host > .pip {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  width: 22%;
+  height: auto;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  border: 2px solid #fff;
+  border-radius: 8px;
+}
+.stage:fullscreen { border-radius: 0; padding: 0; }
+
+.btn.secondary.active { background: var(--accent); color: #fff; }
+
 .tabs { display: flex; gap: 4px; margin-bottom: 12px; }
 .tabs button {
   flex: 1;

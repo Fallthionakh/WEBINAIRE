@@ -7,7 +7,17 @@ const SESSION_KEY = 'webinaire.session';
 
 let state = loadState();
 let roomTab = 'chat';
-let localStream = null;
+
+// Scène de l'organisateur : caméra, partage d'écran ou présentation.
+const PDFJS_URL = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+let cameraStream = null;
+let cameraPending = false;
+let cameraError = false;
+let screenStream = null;
+let stageMode = 'camera'; // 'camera' | 'screen' | 'slides'
+let slides = null;        // { webinarId, name, kind: 'pdf' | 'images', doc, urls, page, count }
+let pdfjsPromise = null;
+let stageToken = 0;
 
 // ---------- Données ----------
 
@@ -95,7 +105,7 @@ function render() {
 
 // 👥 Gestion des utilisateurs
 function renderLogin() {
-  stopCamera();
+  stopMedia();
   app.innerHTML = `
     <div class="card stack" style="max-width:420px;margin:40px auto">
       <h1>Bienvenue</h1>
@@ -137,7 +147,7 @@ function renderLogin() {
 
 // 📅 Planification des webinaires
 function renderList(user) {
-  stopCamera();
+  stopMedia();
   const sorted = [...state.webinars].sort((a, b) =>
     `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`));
 
@@ -184,7 +194,7 @@ function toggleRegistration(id, user) {
 }
 
 function renderNewForm() {
-  stopCamera();
+  stopMedia();
   const today = new Date().toISOString().slice(0, 10);
   app.innerHTML = `
     <div class="card stack">
@@ -241,6 +251,7 @@ function renderRoom(id, user) {
     return;
   }
   const isHost = w.ownerId === user.id;
+  if (slides && slides.webinarId !== id) clearSlides();
 
   if (w.status === 'live' && !w.attendees.includes(user.id)) {
     w.attendees.push(user.id);
@@ -249,9 +260,10 @@ function renderRoom(id, user) {
 
   let stage;
   if (w.status === 'live' && isHost) {
-    stage = '<video id="host-video" autoplay muted playsinline></video>';
+    stage = '<div id="stage-host" class="stage-host"></div>';
   } else if (w.status === 'live') {
     stage = `<div><div class="badge live">● En direct</div><p>${esc(w.speaker)} présente en ce moment.</p>
+      ${stageInfo(w)}
       <p class="muted">La vidéo des participants sera reliée au serveur WebRTC dans une prochaine version.</p></div>`;
   } else if (w.status === 'done') {
     stage = '<div>Ce webinaire est terminé.</div>';
@@ -271,8 +283,24 @@ function renderRoom(id, user) {
         ${isHost ? `
           <div class="row">
             ${w.status === 'scheduled' ? '<button class="btn danger" id="go-live">🎬 Démarrer le direct</button>' : ''}
-            ${w.status === 'live' ? '<button class="btn secondary" id="end-live">Terminer le direct</button>' : ''}
-          </div>` : ''}
+            ${w.status === 'live' ? `
+              <button class="btn secondary ${stageMode === 'camera' ? 'active' : ''}" data-mode="camera">📷 Caméra</button>
+              ${canShareScreen() ? `<button class="btn secondary ${stageMode === 'screen' ? 'active' : ''}" data-mode="screen">🖥️ Partager l'écran</button>` : ''}
+              <label class="btn secondary ${stageMode === 'slides' ? 'active' : ''}">📑 Présentation
+                <input type="file" id="slides-input" accept="application/pdf,image/*" multiple hidden>
+              </label>
+              <button class="btn secondary" id="fullscreen">⛶ Plein écran</button>
+              <button class="btn secondary" id="end-live">Terminer le direct</button>` : ''}
+          </div>
+          ${w.status === 'live' && slides ? `
+            <div class="row">
+              <button class="btn secondary" data-slide="-1" aria-label="Diapositive précédente">◀</button>
+              <span id="slide-pos">${slides.page} / ${slides.count}</span>
+              <button class="btn secondary" data-slide="1" aria-label="Diapositive suivante">▶</button>
+              <span class="muted">${esc(slides.name)}</span>
+              ${stageMode !== 'slides' ? '<button class="btn-link" data-mode="slides">Afficher</button>' : ''}
+              <button class="btn-link" id="close-slides">Fermer</button>
+            </div>` : ''}` : ''}
         <div class="card stack">
           <div>🎤 <strong>${esc(w.speaker)}</strong> · ${esc(w.duration)} min · ${esc(formatPrice(w.price))}</div>
           ${w.description ? `<p style="margin:0">${esc(w.description)}</p>` : ''}
@@ -303,13 +331,40 @@ function renderRoom(id, user) {
   const endLive = document.getElementById('end-live');
   if (endLive) endLive.addEventListener('click', () => {
     w.status = 'done';
+    w.stage = null;
     saveState();
-    stopCamera();
+    stopMedia();
     renderRoom(id, user);
   });
 
-  if (w.status === 'live' && isHost) startCamera();
-  else stopCamera();
+  app.querySelectorAll('[data-mode]').forEach(b =>
+    b.addEventListener('click', () => setStageMode(b.dataset.mode, id)));
+  app.querySelectorAll('[data-slide]').forEach(b =>
+    b.addEventListener('click', () => changeSlide(Number(b.dataset.slide))));
+
+  const slidesInput = document.getElementById('slides-input');
+  if (slidesInput) slidesInput.addEventListener('change', () => loadSlides([...slidesInput.files], id));
+
+  const closeSlides = document.getElementById('close-slides');
+  if (closeSlides) closeSlides.addEventListener('click', () => {
+    clearSlides();
+    if (stageMode === 'slides') stageMode = 'camera';
+    publishStage(id);
+    render();
+  });
+
+  const fullscreen = document.getElementById('fullscreen');
+  if (fullscreen) fullscreen.addEventListener('click', () => {
+    const el = document.querySelector('.stage');
+    if (el.requestFullscreen) el.requestFullscreen();
+  });
+
+  if (w.status === 'live' && isHost) {
+    ensureCamera();
+    renderStage();
+  } else {
+    stopMedia();
+  }
 
   renderPanel(w, user, isHost);
 }
@@ -408,30 +463,203 @@ function renderPanel(w, user, isHost) {
   });
 }
 
-async function startCamera() {
-  const video = document.getElementById('host-video');
-  if (!video) return;
-  if (localStream) { video.srcObject = localStream; return; }
+// Ce que les participants voient décrit (la vidéo arrivera avec le serveur WebRTC).
+function stageInfo(w) {
+  const s = w.stage;
+  if (!s || s.mode === 'camera') return '';
+  if (s.mode === 'screen') return "<p>🖥️ Partage d'écran en cours</p>";
+  return `<p>📑 Présentation : ${esc(s.name)} – diapositive ${esc(s.page)} / ${esc(s.count)}</p>`;
+}
+
+function publishStage(id) {
+  const w = getWebinar(id);
+  if (!w) return;
+  w.stage = { mode: stageMode };
+  if (stageMode === 'slides' && slides) {
+    Object.assign(w.stage, { name: slides.name, page: slides.page, count: slides.count });
+  }
+  saveState();
+}
+
+function canShareScreen() {
+  return !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
+}
+
+async function ensureCamera() {
+  if (cameraStream || cameraPending || cameraError) return;
+  cameraPending = true;
   try {
-    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    video.srcObject = localStream;
+    cameraStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    // L'organisateur a quitté la salle pendant la demande d'autorisation.
+    if (!document.getElementById('stage-host')) stopMedia();
   } catch (e) {
-    video.replaceWith(Object.assign(document.createElement('div'), {
-      textContent: "Caméra indisponible : autorisez l'accès à la caméra et au micro."
-    }));
+    cameraError = true;
+  }
+  cameraPending = false;
+  renderStage();
+}
+
+async function setStageMode(mode, id) {
+  if (mode === 'screen') {
+    if (!screenStream) {
+      try {
+        screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      } catch (e) {
+        return; // partage annulé par l'utilisateur
+      }
+      // Bouton « Arrêter le partage » du navigateur.
+      screenStream.getVideoTracks()[0].addEventListener('ended', () => {
+        screenStream = null;
+        if (stageMode === 'screen') setStageMode('camera', id);
+      });
+    }
+  } else if (screenStream) {
+    screenStream.getTracks().forEach(t => t.stop());
+    screenStream = null;
+  }
+  stageMode = mode;
+  publishStage(id);
+  render();
+}
+
+function loadPdfJs() {
+  if (!pdfjsPromise) {
+    pdfjsPromise = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = PDFJS_URL;
+      script.onload = () => {
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_URL.replace('pdf.min.js', 'pdf.worker.min.js');
+        resolve(window.pdfjsLib);
+      };
+      script.onerror = () => {
+        pdfjsPromise = null;
+        reject(new Error('pdf.js indisponible'));
+      };
+      document.head.append(script);
+    });
+  }
+  return pdfjsPromise;
+}
+
+// 📑 Présentation : un PDF, ou plusieurs images (une par diapositive).
+async function loadSlides(files, id) {
+  if (!files.length) return;
+  let next;
+  try {
+    if (files[0].type === 'application/pdf') {
+      const pdfjs = await loadPdfJs();
+      const doc = await pdfjs.getDocument({ data: await files[0].arrayBuffer() }).promise;
+      next = { webinarId: id, name: files[0].name, kind: 'pdf', doc, page: 1, count: doc.numPages };
+    } else {
+      const images = files
+        .filter(f => f.type.startsWith('image/'))
+        .sort((a, b) => a.name.localeCompare(b.name, 'fr', { numeric: true }));
+      if (!images.length) throw new Error('format non pris en charge');
+      next = {
+        webinarId: id,
+        name: images.length > 1 ? `${images.length} images` : images[0].name,
+        kind: 'images',
+        urls: images.map(f => URL.createObjectURL(f)),
+        page: 1,
+        count: images.length
+      };
+    }
+  } catch (e) {
+    alert("Impossible d'ouvrir ce fichier. Utilisez un PDF ou des images.\n" +
+      'Depuis PowerPoint : Fichier → Exporter → PDF.');
+    return;
+  }
+  clearSlides();
+  slides = next;
+  stageMode = 'slides';
+  if (screenStream) {
+    screenStream.getTracks().forEach(t => t.stop());
+    screenStream = null;
+  }
+  publishStage(id);
+  render();
+}
+
+function changeSlide(delta) {
+  if (!slides) return;
+  const page = Math.min(slides.count, Math.max(1, slides.page + delta));
+  if (page === slides.page) return;
+  slides.page = page;
+  publishStage(slides.webinarId);
+  const pos = document.getElementById('slide-pos');
+  if (pos) pos.textContent = `${slides.page} / ${slides.count}`;
+  if (stageMode === 'slides') renderStage();
+}
+
+function clearSlides() {
+  if (!slides) return;
+  if (slides.kind === 'images') slides.urls.forEach(u => URL.revokeObjectURL(u));
+  if (slides.doc) slides.doc.destroy();
+  slides = null;
+}
+
+function mediaElement(stream) {
+  const video = document.createElement('video');
+  video.autoplay = true;
+  video.muted = true;
+  video.playsInline = true;
+  video.srcObject = stream;
+  return video;
+}
+
+async function renderStage() {
+  const host = document.getElementById('stage-host');
+  if (!host) return;
+  const token = ++stageToken;
+
+  let main;
+  if (stageMode === 'screen' && screenStream) {
+    main = mediaElement(screenStream);
+  } else if (stageMode === 'slides' && slides) {
+    if (slides.kind === 'images') {
+      main = document.createElement('img');
+      main.src = slides.urls[slides.page - 1];
+      main.alt = `Diapositive ${slides.page}`;
+    } else {
+      const page = await slides.doc.getPage(slides.page);
+      if (token !== stageToken) return;
+      const viewport = page.getViewport({ scale: 2 });
+      main = document.createElement('canvas');
+      main.width = viewport.width;
+      main.height = viewport.height;
+      await page.render({ canvasContext: main.getContext('2d'), viewport }).promise;
+      if (token !== stageToken) return;
+    }
+  } else if (cameraStream) {
+    main = mediaElement(cameraStream);
+  } else {
+    main = document.createElement('p');
+    main.textContent = cameraError
+      ? "Caméra indisponible : autorisez l'accès à la caméra et au micro."
+      : 'Démarrage de la caméra…';
+  }
+
+  host.replaceChildren(main);
+  // Petite vignette de la caméra pendant le partage d'écran ou la présentation.
+  if (stageMode !== 'camera' && cameraStream && main.tagName !== 'P') {
+    const pip = mediaElement(cameraStream);
+    pip.className = 'pip';
+    host.append(pip);
   }
 }
 
-function stopCamera() {
-  if (localStream) {
-    localStream.getTracks().forEach(t => t.stop());
-    localStream = null;
-  }
+function stopMedia() {
+  [cameraStream, screenStream].forEach(s => s && s.getTracks().forEach(t => t.stop()));
+  cameraStream = null;
+  screenStream = null;
+  cameraError = false;
+  stageMode = 'camera';
+  clearSlides();
 }
 
 // 📊 Analytics & Reporting
 function renderAnalytics() {
-  stopCamera();
+  stopMedia();
   const ws = state.webinars;
   const registrations = ws.reduce((n, w) => n + w.registrations.length, 0);
   const attendees = ws.reduce((n, w) => n + w.attendees.length, 0);
@@ -477,6 +705,15 @@ document.getElementById('logout').addEventListener('click', () => {
 });
 
 window.addEventListener('hashchange', render);
+
+// Flèches du clavier pour changer de diapositive.
+document.addEventListener('keydown', e => {
+  if (!slides || stageMode !== 'slides') return;
+  const tag = document.activeElement && document.activeElement.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+  if (e.key === 'ArrowRight' || e.key === 'PageDown') changeSlide(1);
+  if (e.key === 'ArrowLeft' || e.key === 'PageUp') changeSlide(-1);
+});
 
 // Synchronisation temps réel entre onglets du même navigateur.
 window.addEventListener('storage', e => {

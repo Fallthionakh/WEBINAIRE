@@ -13,7 +13,7 @@ construire l'architecture complète décrite plus bas.
 |---|---|
 | 👥 Gestion des utilisateurs | Connexion par nom + e-mail, rôles *organisateur* / *participant* |
 | 📅 Planification des webinaires | Création (titre, intervenant, date, durée, places), inscription / désinscription |
-| 🎬 Diffusion en direct | Démarrer / terminer le direct, aperçu caméra de l'organisateur |
+| 🎬 Diffusion en direct | Démarrer / terminer le direct, caméra, partage d'écran, présentation PDF ou images (flèches ◀ ▶ ou clavier), plein écran |
 | 💬 Interaction en temps réel | Chat, questions avec votes, sondages (synchronisés entre onglets) |
 | 📊 Analytics & Reporting | Inscriptions, taux de présence, messages, revenus par webinaire |
 | 💰 Monétisation (optionnel) | Prix en FCFA par webinaire, revenus estimés |
@@ -25,8 +25,13 @@ Aucune installation n'est nécessaire : ouvrez `index.html` dans un navigateur.
 Pour tester le « temps réel », ouvrez l'application dans deux onglets :
 un organisateur qui démarre le direct, un participant qui écrit dans le chat.
 
-> La caméra ne fonctionne que si la page est servie en `https://` ou depuis
-> `localhost` (par exemple avec GitHub Pages).
+> La caméra et le partage d'écran ne fonctionnent que si la page est servie en
+> `https://` ou depuis `localhost` (par exemple avec GitHub Pages). Le partage
+> d'écran n'est pas disponible sur téléphone.
+
+Pour une présentation PowerPoint, exportez-la d'abord en PDF
+(*Fichier → Exporter → PDF*). Les PDF sont affichés avec
+[pdf.js](https://mozilla.github.io/pdf.js/), chargé depuis cdnjs.
 
 ## Architecture cible
 
