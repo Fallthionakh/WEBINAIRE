@@ -651,7 +651,7 @@ function webinarCard(w, { reg = null, pending = 0, showActions = false } = {}) {
   return `
     <article class="card wcard">
       <div class="row spread"><div class="row">${statusBadge(w)}</div>
-        ${reg ? regBadge(reg.status) : ''}${pending ? `<span class="badge warn">⏳ ${pending} à valider</span>` : ''}</div>
+        ${reg ? regBadge(reg.status) : ''}</div>
       <div class="when">
         ${dateBox(w.starts_at)}
         <div>
@@ -660,6 +660,8 @@ function webinarCard(w, { reg = null, pending = 0, showActions = false } = {}) {
         </div>
       </div>
       ${w.description ? `<p class="muted small clamp">${esc(w.description)}</p>` : ''}
+      ${pending ? `<button class="notice warn" data-pending="${w.id}" style="border:0;font:inherit;text-align:left;cursor:pointer">
+        ⏳ <strong>${pending} apprenant${pending > 1 ? 's' : ''}</strong> attend${pending > 1 ? 'ent' : ''} votre validation → Voir</button>` : ''}
       <div class="foot">
         <span class="muted small">🧑‍🏫 ${esc(w.encadreur?.full_name || '')}${inscrits !== null ? ` · 🎓 ${inscrits}` : ''}</span>
         ${action}
@@ -735,9 +737,11 @@ async function viewWebinars(view, token) {
   view.querySelector('#search').addEventListener('input', e => { search = e.target.value.trim().toLowerCase(); draw(); });
 }
 
-// Boutons « S'inscrire » / « Se désinscrire » d'une liste de cartes.
+// Boutons des cartes : « S'inscrire », « Se désinscrire » et demandes à valider.
 function bindRegisterButtons(container, regMap, redraw) {
   container.addEventListener('click', async e => {
+    const pending = e.target.closest('[data-pending]');
+    if (pending) return pendingDialog(pending.dataset.pending);
     const reg = e.target.closest('[data-register]');
     const unreg = e.target.closest('[data-unregister]');
     if (!reg && !unreg) return;
@@ -747,6 +751,55 @@ function bindRegisterButtons(container, regMap, redraw) {
     if (reg) regMap.set(id, { webinar_id: id, status: 'en_attente' });
     else regMap.delete(id);
     redraw();
+  });
+}
+
+// Encadreur : valider les demandes d'inscription d'un webinaire sans quitter la liste.
+async function pendingDialog(webinarId) {
+  const { data, error } = await sb.from('registrations')
+    .select('apprenant_id, registered_at, apprenant:profiles!apprenant_id(full_name, email)')
+    .eq('webinar_id', webinarId).eq('status', 'en_attente').order('registered_at');
+  if (error) return fail(error);
+  let changed = false;
+  openModal(`
+    <h2>⏳ Demandes d’inscription à valider</h2>
+    <div class="list" id="pending-list" style="max-height:380px;overflow-y:auto"></div>
+    <div class="actions">
+      <button class="btn" data-close>Fermer</button>
+      <button class="btn primary" id="approve-all-dlg">✓ Tout approuver</button>
+    </div>`);
+  onModalClose = () => { if (changed) route(); };
+
+  const draw = () => {
+    modal.querySelector('#pending-list').innerHTML = data.length ? data.map(r => `
+      <div class="list-item">
+        <div class="avatar sm">${esc(initials(r.apprenant?.full_name))}</div>
+        <div class="grow"><strong>${esc(r.apprenant?.full_name)}</strong>
+          <div class="muted small">${esc(r.apprenant?.email)} · demande du ${esc(fmtShortDate(r.registered_at))} à ${esc(fmtTime(r.registered_at))}</div></div>
+        <button class="btn primary sm" data-decide="approuve" data-user="${r.apprenant_id}">✓ Approuver</button>
+        <button class="btn ghost sm" data-decide="suspendu" data-user="${r.apprenant_id}">Refuser</button>
+      </div>`).join('') : emptyState('✅', 'Toutes les demandes ont été traitées.');
+    modal.querySelector('#approve-all-dlg').hidden = !data.length;
+    modal.querySelectorAll('[data-decide]').forEach(b => b.addEventListener('click', async () => {
+      b.disabled = true;
+      const { error: err } = await sb.from('registrations').update({ status: b.dataset.decide })
+        .eq('webinar_id', webinarId).eq('apprenant_id', b.dataset.user);
+      if (err) { b.disabled = false; return fail(err); }
+      data.splice(data.findIndex(r => r.apprenant_id === b.dataset.user), 1);
+      changed = true;
+      toast(b.dataset.decide === 'approuve' ? 'Inscription approuvée ✓' : 'Demande refusée.', 'success');
+      draw();
+    }));
+  };
+  draw();
+  modal.querySelector('#approve-all-dlg').addEventListener('click', async () => {
+    const { error: err } = await sb.from('registrations').update({ status: 'approuve' })
+      .eq('webinar_id', webinarId).eq('status', 'en_attente');
+    if (err) return fail(err);
+    toast(`${data.length} inscription${data.length > 1 ? 's' : ''} approuvée${data.length > 1 ? 's' : ''} ✓`, 'success');
+    data.length = 0;
+    changed = true;
+    draw();
   });
 }
 
@@ -981,8 +1034,12 @@ async function viewWebinarDetail(view, token, id) {
         <button class="btn danger" id="cancel-w">Annuler le webinaire</button>`;
     } else if (w.status === 'en_direct') {
       actions = `<a class="btn live" href="#/salle/${id}">Rejoindre la salle</a>`;
+    } else if (w.status === 'termine') {
+      actions = `<button class="btn live" id="reopen-w">🔓 Rouvrir le direct</button>
+        <a class="btn" href="#/webinaires/${id}/reprogrammer">🗓️ Reprogrammer</a>`;
     } else if (w.status === 'annule') {
-      actions = '<button class="btn danger" id="delete-w">Supprimer</button>';
+      actions = `<button class="btn primary" id="restore-w">↩ Rétablir le webinaire</button>
+        <button class="btn danger" id="delete-w">Supprimer</button>`;
     }
   } else if (profile.role === 'apprenant') {
     if (reg?.status === 'suspendu') {
@@ -1058,6 +1115,13 @@ async function viewWebinarDetail(view, token, id) {
     toast('Webinaire annulé.');
     route();
   });
+  on('#reopen-w', () => reopenWebinar(w));
+  on('#restore-w', async () => {
+    const { error: err } = await sb.from('webinars').update({ status: 'planifie', cancel_reason: null }).eq('id', id);
+    if (err) return fail(err);
+    toast('Webinaire rétabli ✓ Pensez à vérifier sa date.', 'success');
+    route();
+  });
   on('#delete-w', async () => {
     if (!await confirmDialog('Supprimer définitivement ce webinaire ?', { confirmLabel: 'Supprimer', danger: true })) return;
     const { error: err } = await sb.from('webinars').delete().eq('id', id);
@@ -1067,6 +1131,19 @@ async function viewWebinarDetail(view, token, id) {
   });
 
   if (manage) renderManagement(document.getElementById('manage'), w, token);
+}
+
+// Rouvrir un webinaire terminé : le direct reprend, la présence continue de s'enregistrer.
+async function reopenWebinar(w) {
+  if (!await confirmDialog('Rouvrir le direct ? Les apprenants approuvés pourront revenir dans la salle.', {
+    confirmLabel: 'Rouvrir le direct'
+  })) return false;
+  const { error } = await sb.from('webinars').update({ status: 'en_direct' }).eq('id', w.id);
+  if (error) { fail(error); return false; }
+  toast('Direct rouvert ✓', 'success');
+  if (location.hash === `#/salle/${w.id}`) onWebinarUpdate({ status: 'en_direct' });
+  else location.hash = `#/salle/${w.id}`;
+  return true;
 }
 
 // Inscrits et liste de présence (encadreur / admin).
@@ -1220,8 +1297,48 @@ async function setRegistrationStatus(webinarId, userId, status) {
 function emptyRoom() {
   return {
     id: null, webinar: null, isHost: false, channel: null, sessionId: null, heartbeat: null,
-    tab: 'chat', messages: [], polls: [], votes: [], presence: {}
+    tab: 'chat', messages: [], polls: [], votes: [], presence: {},
+    joinedAt: null, hand: false, handAt: null, handsSeen: new Set(), pendingRegs: []
   };
+}
+
+// Ma présence dans la salle (nom, rôle, main levée), visible des autres en temps réel.
+function trackMe() {
+  if (!room.channel) return;
+  room.channel.track({
+    user_id: profile.id, name: profile.full_name, role: profile.role,
+    joined_at: room.joinedAt, hand: room.hand, hand_at: room.handAt
+  });
+}
+
+function setHand(raised) {
+  room.hand = raised;
+  room.handAt = raised ? new Date().toISOString() : null;
+  trackMe();
+  renderHandBar();
+}
+
+function renderHandBar() {
+  const bar = document.getElementById('hand-bar');
+  if (!bar) return;
+  bar.innerHTML = room.hand
+    ? `<div class="notice warn row spread"><span>✋ <strong>Vous avez levé la main.</strong> L’encadreur est prévenu et vous donnera la parole.</span>
+        <button class="btn sm" id="hand-toggle">Baisser la main</button></div>`
+    : '<button class="btn" id="hand-toggle">✋ Lever la main</button>';
+  bar.querySelector('#hand-toggle').addEventListener('click', () => setHand(!room.hand));
+}
+
+// Demandes d'inscription en attente, admissibles depuis la salle (encadreur).
+async function loadPendingRegs() {
+  if (!room.isHost) return;
+  const id = room.id;
+  const { data } = await sb.from('registrations')
+    .select('apprenant_id, registered_at, apprenant:profiles!apprenant_id(full_name, email)')
+    .eq('webinar_id', id).eq('status', 'en_attente').order('registered_at');
+  if (room.id !== id) return;
+  room.pendingRegs = data || [];
+  renderRoomMeta();
+  if (room.tab === 'participants') renderPanel();
 }
 
 let room = emptyRoom();
@@ -1256,7 +1373,7 @@ async function viewRoom(view, token, id) {
     }
   }
 
-  room = { ...emptyRoom(), id, webinar: w, isHost };
+  room = { ...emptyRoom(), id, webinar: w, isHost, joinedAt: new Date().toISOString() };
 
   const [msgs, polls] = await Promise.all([
     sb.from('messages').select('*').eq('webinar_id', id).order('created_at').limit(500),
@@ -1275,8 +1392,20 @@ async function viewRoom(view, token, id) {
   channel
     .on('presence', { event: 'sync' }, () => {
       room.presence = channel.presenceState();
+      // L'encadreur est prévenu de chaque nouvelle main levée.
+      const hands = onlineList().filter(p => p.hand);
+      if (room.isHost) {
+        hands.filter(p => !room.handsSeen.has(p.user_id)).forEach(p => toast(`✋ ${p.name} lève la main`));
+      }
+      room.handsSeen = new Set(hands.map(p => p.user_id));
       renderRoomMeta();
       if (room.tab === 'participants') renderPanel();
+    })
+    .on('broadcast', { event: 'lower-hand' }, ({ payload }) => {
+      if (payload.user_id === profile.id && room.hand) {
+        setHand(false);
+        toast('L’encadreur a baissé votre main.');
+      }
     })
     .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `webinar_id=eq.${id}` }, p => {
       if (!room.messages.some(m => m.id === p.new.id)) room.messages.push(p.new);
@@ -1301,13 +1430,17 @@ async function viewRoom(view, token, id) {
     .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'registrations',
       filter: `apprenant_id=eq.${profile.id}` }, p => {
       if (p.new.webinar_id === id && p.new.status !== 'approuve') kickOut("L'encadreur a suspendu votre inscription à ce webinaire.");
-    })
-    .subscribe(status => {
-      if (status === 'SUBSCRIBED') {
-        channel.track({ user_id: profile.id, name: profile.full_name, role: profile.role, joined_at: new Date().toISOString() });
-      }
     });
+  if (isHost) {
+    // Nouvelles demandes d'inscription pendant le direct.
+    channel.on('postgres_changes', { event: '*', schema: 'public', table: 'registrations',
+      filter: `webinar_id=eq.${id}` }, () => loadPendingRegs());
+  }
+  channel.subscribe(status => {
+    if (status === 'SUBSCRIBED') trackMe();
+  });
 
+  await loadPendingRegs();
   if (w.status === 'en_direct' && !isHost) await startAttendance();
   if (isStale(token) || room.id !== id) return;
   renderRoomView();
@@ -1377,11 +1510,17 @@ function onlineList() {
     .sort((a, b) => (a.name || '').localeCompare(b.name || '', 'fr'));
 }
 
+function participantsLabel() {
+  const hands = onlineList().filter(p => p.hand).length;
+  return `👥 ${onlineList().length}${hands ? ` · ✋ ${hands}` : ''}${room.pendingRegs.length ? ` · ⏳ ${room.pendingRegs.length}` : ''}`;
+}
+
 function renderRoomMeta() {
+  const hands = onlineList().filter(p => p.hand).length;
   const el = document.getElementById('online-count');
-  if (el) el.textContent = `👥 ${onlineList().length} en ligne`;
+  if (el) el.textContent = `👥 ${onlineList().length} en ligne${hands ? ` · ✋ ${hands} main${hands > 1 ? 's' : ''} levée${hands > 1 ? 's' : ''}` : ''}`;
   const tabBtn = document.querySelector('[data-rtab="participants"]');
-  if (tabBtn) tabBtn.textContent = `👥 ${onlineList().length}`;
+  if (tabBtn) tabBtn.textContent = participantsLabel();
 }
 
 function renderRoomView() {
@@ -1411,7 +1550,7 @@ function renderRoomView() {
   }
 
   const tabs = [['chat', '💬 Chat'], ['questions', '❓ Questions'], ['sondages', '📊 Sondages']];
-  if (host) tabs.push(['participants', `👥 ${onlineList().length}`]);
+  if (host) tabs.push(['participants', participantsLabel()]);
 
   view.innerHTML = `
     <div class="page-head">
@@ -1425,6 +1564,7 @@ function renderRoomView() {
       <section>
         <div class="stage">${stage}</div>
         ${host ? stageToolbar(w) : ''}
+        ${!host && w.status === 'en_direct' ? '<div class="stage-tools" id="hand-bar"></div>' : ''}
       </section>
       <aside class="card side-panel">
         <div class="tabs">${tabs.map(([k, l]) =>
@@ -1440,6 +1580,7 @@ function renderRoomView() {
     renderPanel();
   }));
   if (host) bindStageToolbar(w);
+  renderHandBar();
   renderPanel();
 }
 
@@ -1447,6 +1588,9 @@ function stageToolbar(w) {
   if (w.status === 'planifie') {
     return `<div class="stage-tools"><button class="btn live" id="go-live">🎬 Démarrer le direct</button>
       <span class="muted small" style="align-self:center">Les apprenants inscrits pourront entrer dès le démarrage.</span></div>`;
+  }
+  if (w.status === 'termine') {
+    return '<div class="stage-tools"><button class="btn live" id="reopen-live">🔓 Rouvrir le direct</button></div>';
   }
   if (w.status !== 'en_direct') return '';
   return `
@@ -1475,6 +1619,7 @@ function bindStageToolbar(w) {
   const view = document.getElementById('view');
   const on = (sel, fn) => { const el = view.querySelector(sel); if (el) el.addEventListener('click', fn); };
 
+  on('#reopen-live', () => reopenWebinar(w));
   on('#go-live', async () => {
     const { error } = await sb.from('webinars').update({ status: 'en_direct' }).eq('id', w.id);
     if (error) return fail(error);
@@ -1516,16 +1661,45 @@ function renderPanel() {
   const canPost = w.status === 'en_direct' || (room.isHost && w.status === 'planifie');
 
   if (room.tab === 'participants') {
-    const people = onlineList();
-    panel.innerHTML = people.length ? `<div class="list">${people.map(p => `
-      <div class="list-item">
-        <div class="avatar sm">${esc(initials(p.name))}</div>
-        <div class="grow"><div>${esc(p.name)}</div>
-          <div class="muted small">${ROLE_LABELS[p.role] || ''} · depuis ${esc(fmtTime(p.joined_at))}</div></div>
-        ${p.role === 'apprenant' ? `<button class="btn danger sm" data-kick="${p.user_id}">Exclure</button>` : ''}
-      </div>`).join('')}</div>` : emptyState('👥', 'Personne en ligne pour le moment.');
+    // Mains levées d'abord (dans l'ordre où elles ont été levées), puis les autres.
+    const people = onlineList().sort((a, b) =>
+      (b.hand ? 1 : 0) - (a.hand ? 1 : 0) || (a.hand_at || '').localeCompare(b.hand_at || ''));
+    const hands = people.filter(p => p.hand).length;
+    panel.innerHTML = `<div class="messages">
+      ${room.pendingRegs.length ? `
+        <div class="notice warn"><strong>⏳ En attente d’admission (${room.pendingRegs.length})</strong>
+          <div class="list">${room.pendingRegs.map(r => `
+            <div class="list-item">
+              <div class="avatar sm">${esc(initials(r.apprenant?.full_name))}</div>
+              <div class="grow" style="color:var(--text)">${esc(r.apprenant?.full_name)}</div>
+              <button class="btn primary sm" data-admit="${r.apprenant_id}">Admettre</button>
+              <button class="btn ghost sm" data-refuse="${r.apprenant_id}">Refuser</button>
+            </div>`).join('')}</div></div>` : ''}
+      <div class="muted small">En ligne : ${people.length}${hands ? ` · ✋ ${hands} main${hands > 1 ? 's' : ''} levée${hands > 1 ? 's' : ''}` : ''}</div>
+      ${people.length ? `<div class="list">${people.map(p => `
+        <div class="list-item">
+          <div class="avatar sm">${esc(initials(p.name))}</div>
+          <div class="grow"><div>${p.hand ? '✋ ' : ''}${esc(p.name)}</div>
+            <div class="muted small">${ROLE_LABELS[p.role] || ''} · ${p.hand
+              ? `main levée à ${esc(fmtTime(p.hand_at))}` : `depuis ${esc(fmtTime(p.joined_at))}`}</div></div>
+          ${p.hand ? `<button class="btn sm" data-lower="${p.user_id}" title="Baisser la main">👇</button>` : ''}
+          ${p.role === 'apprenant' ? `<button class="btn danger sm" data-kick="${p.user_id}">Exclure</button>` : ''}
+        </div>`).join('')}</div>` : emptyState('👥', 'Personne en ligne pour le moment.')}
+    </div>`;
     panel.querySelectorAll('[data-kick]').forEach(b => b.addEventListener('click', () =>
       setRegistrationStatus(w.id, b.dataset.kick, 'suspendu')));
+    panel.querySelectorAll('[data-lower]').forEach(b => b.addEventListener('click', () =>
+      room.channel.send({ type: 'broadcast', event: 'lower-hand', payload: { user_id: b.dataset.lower } })));
+    panel.querySelectorAll('[data-admit], [data-refuse]').forEach(b => b.addEventListener('click', async () => {
+      const status = b.dataset.admit ? 'approuve' : 'suspendu';
+      const userId = b.dataset.admit || b.dataset.refuse;
+      b.disabled = true;
+      const { error } = await sb.from('registrations').update({ status })
+        .eq('webinar_id', w.id).eq('apprenant_id', userId);
+      if (error) { b.disabled = false; return fail(error); }
+      toast(status === 'approuve' ? 'Apprenant admis ✓ Il peut entrer dans la salle.' : 'Demande refusée.', 'success');
+      loadPendingRegs();
+    }));
     return;
   }
 
