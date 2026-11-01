@@ -3,6 +3,6 @@
 // les droits sont limités par les règles RLS de supabase/schema.sql.
 // Ne mettez JAMAIS ici la clé « secret » ou « service_role ».
 window.WEBINAIRE_CONFIG = {
-  supabaseUrl: '',
-  supabaseKey: ''
+  supabaseUrl: 'https://ybwtmckzrzkzzhhnefao.supabase.co',
+  supabaseKey: 'sb_publishable_pQqi73ukGXro540ZNbtBeA_uiahQ6BA'
 };
