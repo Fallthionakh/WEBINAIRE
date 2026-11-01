@@ -296,6 +296,10 @@ input:focus, textarea:focus, select:focus {
 
 .search { max-width: 320px; margin: 0; }
 
+.pwd-field { position: relative; }
+.pwd-field input { padding-right: 48px; }
+.pwd-field button { position: absolute; right: 4px; top: 50%; transform: translateY(-50%); margin-top: 3px; }
+
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip {
   border: 1px solid var(--border);
