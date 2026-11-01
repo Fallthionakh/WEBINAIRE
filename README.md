@@ -20,7 +20,8 @@ Site : <https://fallthionakh.github.io/WEBINAIRE/>
 - **Inscriptions aux webinaires** : l'apprenant demande à s'inscrire (page « Mes inscriptions », accessible aussi depuis son profil) ; l'encadreur du webinaire approuve, refuse, suspend ou réactive chaque demande (ou « Tout approuver »). Seules les inscriptions approuvées donnent accès au direct.
 - **Ressources des webinaires** : depuis un webinaire, ajouter des ressources de la bibliothèque ou déposer un fichier ; depuis la bibliothèque, « Lier à un webinaire ». Une ressource peut servir à plusieurs webinaires.
 - **Webinaires** : titre, description, date, heure de début, durée et heure de fin (calculées l'une de l'autre), reprogrammation (badge « Reprogrammé »), annulation avec motif.
-- **Salle en direct** : caméra, partage d'écran, présentation PDF ou images (◀ ▶, flèches du clavier, depuis la bibliothèque), plein écran ; chat, questions et sondages en temps réel ; liste des participants en ligne avec bouton « Exclure ».
+- **Visio (Daily)** : son et vidéo pour tous, partage d'écran pour l'encadreur et les apprenants ; l'encadreur (propriétaire de la salle) peut couper les micros et retirer un participant. Salle Daily privée : on n'y entre qu'avec un jeton délivré par la fonction `daily-token`, après vérification de l'inscription. Sans configuration Daily, la salle revient au mode local (caméra, partage d'écran et présentation visibles par l'encadreur seulement).
+- **Salle en direct** : chat, questions et sondages en temps réel ; mains levées ; admission des demandes en attente ; liste des participants en ligne avec bouton « Exclure ».
 - **Liste de présence automatique** : chaque connexion est enregistrée par le serveur (date, heure de connexion, heure de déconnexion, durée), avec le total par apprenant et les absents. Export Excel / CSV.
 - **Bibliothèque** : PDF, vidéos (lecture intégrée), PowerPoint, Word, Excel, images ; 50 Mo par fichier ; ressources liées à un webinaire.
 - Interface responsive (ordinateur et téléphone), mode sombre automatique.
@@ -51,6 +52,9 @@ passe n'est stocké dans le code.
    `wommatsn@gmail.com` (cocher *Auto Confirm User*). Il reçoit automatiquement le rôle admin.
 5. Dans **Authentication → URL Configuration**, mettre l'adresse du site en *Site URL*.
 6. Copier l'URL du projet et la clé *publishable* (ou *anon*) dans `config.js`.
+7. Visio : créer un compte [Daily](https://www.daily.co), ajouter sa clé API dans
+   **Edge Functions → Secrets** sous le nom `DAILY_API_KEY`, puis déployer
+   `supabase/functions/daily-token/index.ts` sous le nom `daily-token` (vérification JWT activée).
 
 Pour une présentation PowerPoint pendant le direct, exportez-la d'abord en PDF
 (*Fichier → Exporter → PDF*). Les PDF sont affichés avec
@@ -62,7 +66,7 @@ Pour une présentation PowerPoint pendant le direct, exportez-la d'abord en PDF
 - [x] Planification, reprogrammation, annulation
 - [x] Liste de présence automatique et export
 - [x] Bibliothèque de ressources
-- [ ] Transmission vidéo WebRTC vers les apprenants (LiveKit, Jitsi ou Daily)
+- [x] Visio pour tous les participants (Daily)
 - [ ] Rappels par e-mail avant chaque webinaire (SMTP personnalisé)
 - [ ] Enregistrement des replays dans la bibliothèque
 - [ ] Attestations de présence en PDF
