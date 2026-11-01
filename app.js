@@ -1597,6 +1597,7 @@ function emptyRoom() {
     tab: 'chat', messages: [], polls: [], votes: [], presence: {},
     joinedAt: null, hand: false, handAt: null, handsSeen: new Set(),
     lobby: 'admis', lobbyList: [], lobbySeen: new Set(), lobbyError: '', wide: false,
+    departed: new Map(), // personnes vues dans la salle puis parties : user_id → { ...présence, left_at }
     video: null, call: null, videoError: ''
   };
 }
@@ -1931,7 +1932,17 @@ async function viewRoom(view, token, id) {
   room.channel = channel;
   channel
     .on('presence', { event: 'sync' }, () => {
+      // Copie de la liste précédente (Supabase peut modifier l'objet de présence sur place).
+      const before = room.lastOnline || [];
       room.presence = channel.presenceState();
+      room.lastOnline = onlineList().map(p => ({ ...p }));
+      // Qui vient de partir (ou de revenir) : affiché « A quitté la réunion » chez l'organisateur.
+      const online = new Set(room.lastOnline.map(p => p.user_id));
+      before.filter(p => !online.has(p.user_id) && p.user_id !== profile.id).forEach(p => {
+        room.departed.set(p.user_id, { ...p, hand: false, left_at: new Date().toISOString() });
+        if (room.isHost) toast(`🚪 ${p.name} a quitté la réunion`);
+      });
+      online.forEach(uid => room.departed.delete(uid));
       // L'encadreur est prévenu de chaque nouvelle main levée.
       const hands = onlineList().filter(p => p.hand);
       if (room.isHost) {
@@ -2034,7 +2045,11 @@ async function leaveRoom() {
   if (!room.isHost) sb.rpc('lobby_leave', { w: room.id });
   stopAttendance();
   stopVideo();
-  if (room.channel) await sb.removeChannel(room.channel);
+  if (room.channel) {
+    // Départ annoncé tout de suite aux autres (sinon il faut attendre la coupure de connexion).
+    try { await room.channel.untrack(); } catch (e) { /* déjà déconnecté */ }
+    await sb.removeChannel(room.channel);
+  }
   stopMedia();
   room = emptyRoom();
 }
@@ -2049,6 +2064,7 @@ function kickOut(message) {
 window.addEventListener('pagehide', () => {
   if (room.sessionId) keepaliveRpc('attendance_leave', { session_id: room.sessionId });
   if (room.id && !room.isHost) keepaliveRpc('lobby_leave', { w: room.id });
+  if (room.channel) room.channel.untrack();
   if (appSession.id) keepaliveRpc('session_end', { sid: appSession.id });
 });
 
@@ -2296,6 +2312,15 @@ function renderPanel() {
           ${p.hand ? `<button class="btn sm" data-lower="${p.user_id}" title="Baisser la main">👇</button>` : ''}
           ${p.role === 'apprenant' ? `<button class="btn danger sm" data-kick="${p.user_id}">Exclure</button>` : ''}
         </div>`).join('')}</div>` : emptyState('👥', 'Personne en ligne pour le moment.')}
+      ${room.departed.size ? `
+        <div class="muted small" style="margin-top:8px">Ont quitté la réunion : ${room.departed.size}</div>
+        <div class="list">${[...room.departed.values()].sort((a, b) => b.left_at.localeCompare(a.left_at)).map(p => `
+          <div class="list-item" style="opacity:.7">
+            <div class="avatar sm" style="filter:grayscale(1)">${esc(initials(p.name))}</div>
+            <div class="grow"><div>${esc(p.name)}</div>
+              <div class="muted small">${ROLE_LABELS[p.role] || ''} · présent depuis ${esc(fmtTime(p.joined_at))}</div></div>
+            <span class="badge done">🚪 A quitté la réunion à ${esc(fmtTime(p.left_at))}</span>
+          </div>`).join('')}</div>` : ''}
     </div>`;
     panel.querySelectorAll('[data-kick]').forEach(b => b.addEventListener('click', async () => {
       const person = people.find(p => p.user_id === b.dataset.kick);
