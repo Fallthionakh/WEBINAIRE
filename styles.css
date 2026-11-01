@@ -387,7 +387,7 @@ th { text-align: left; font-size: .78rem; text-transform: uppercase; letter-spac
 th, td { padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
 tr:last-child td { border-bottom: 0; }
 
-.info-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+.info-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(min(160px, 100%), 1fr)); }
 .info-grid .k { font-size: .78rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; font-weight: 600; }
 .info-grid .v { font-weight: 600; }
 
@@ -495,7 +495,7 @@ tr:last-child td { border-bottom: 0; }
 }
 .modal.wide { width: min(960px, calc(100vw - 32px)); }
 .modal::backdrop { background: rgba(10, 12, 20, .55); backdrop-filter: blur(2px); }
-.modal-card { padding: 24px; display: grid; gap: 16px; }
+.modal-card { padding: 24px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
 .modal video { width: 100%; border-radius: 12px; background: #000; }
 
 .toasts { position: fixed; z-index: 100; right: 16px; bottom: 16px; display: grid; gap: 8px; max-width: calc(100vw - 32px); }

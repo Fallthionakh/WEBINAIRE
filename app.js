@@ -9,8 +9,10 @@ const sb = configured ? window.supabase.createClient(CONFIG.supabaseUrl, CONFIG.
 
 const ROLE_LABELS = { admin: 'Administrateur', encadreur: 'Encadreur', apprenant: 'Apprenant' };
 const STATUS_LABELS = { planifie: 'Planifié', en_direct: 'En direct', termine: 'Terminé', annule: 'Annulé' };
+const ACCOUNT_STATUS = { en_attente: ['En attente', 'warn'], approuve: ['Approuvé', 'ok'], suspendu: ['Suspendu', 'cancel'] };
 const MAX_FILE_BYTES = 50 * 1024 * 1024; // limite de l'offre gratuite Supabase
 const HEARTBEAT_MS = 30000;
+const SESSION_PING_MS = 60000;
 const PDFJS_URL = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
 const SITE_URL = location.origin + location.pathname;
 
@@ -52,6 +54,20 @@ function fmtDuration(ms) {
   if (h) return `${h} h ${pad(m)} min`;
   if (m) return `${m} min ${pad(s)} s`;
   return `${s} s`;
+}
+
+function fmtRelative(iso) {
+  if (!iso) return 'Jamais';
+  const diff = Date.now() - new Date(iso).getTime();
+  if (diff < 2 * SESSION_PING_MS) return 'En ligne';
+  if (diff < 3600 * 1000) return `Il y a ${Math.round(diff / 60000)} min`;
+  if (diff < 24 * 3600 * 1000) return `Il y a ${Math.round(diff / 3600000)} h`;
+  return `${fmtShortDate(iso)} à ${fmtTime(iso)}`;
+}
+
+function accountBadge(status) {
+  const [label, cls] = ACCOUNT_STATUS[status] || ACCOUNT_STATUS.approuve;
+  return `<span class="badge ${cls}">${label}</span>`;
 }
 
 function fmtMinutes(min) {
@@ -133,13 +149,24 @@ function openModal(html, { wide = false } = {}) {
   return modal;
 }
 
+// Fonction appelée à la fermeture de la fenêtre (annulation, Échap, clic à côté).
+// L'événement « close » du navigateur est asynchrone, on ne s'appuie donc pas dessus.
+let onModalClose = null;
+
 function closeModal() {
   if (modal.open) modal.close();
   modal.innerHTML = '';
+  const callback = onModalClose;
+  onModalClose = null;
+  if (callback) callback();
 }
 
 modal.addEventListener('click', e => {
   if (e.target === modal || e.target.closest('[data-close]')) closeModal();
+});
+modal.addEventListener('cancel', e => {
+  e.preventDefault();
+  closeModal();
 });
 
 function confirmDialog(message, { confirmLabel = 'Confirmer', danger = false, input = null } = {}) {
@@ -151,12 +178,12 @@ function confirmDialog(message, { confirmLabel = 'Confirmer', danger = false, in
         <button class="btn" data-close>Annuler</button>
         <button class="btn ${danger ? 'danger' : 'primary'}" id="dlg-ok">${esc(confirmLabel)}</button>
       </div>`);
-    const done = value => { modal.removeEventListener('close', onClose); closeModal(); resolve(value); };
-    const onClose = () => resolve(false);
-    modal.addEventListener('close', onClose, { once: true });
+    onModalClose = () => resolve(false);
     document.getElementById('dlg-ok').addEventListener('click', () => {
       const field = document.getElementById('dlg-input');
-      done(field ? field.value.trim() || true : true);
+      onModalClose = null;
+      closeModal();
+      resolve(field ? field.value.trim() || true : true);
     });
   });
 }
@@ -226,11 +253,14 @@ async function route() {
         <p class="muted">Votre compte existe mais son profil n'a pas été créé. Vérifiez que le script
         <code>supabase/schema.sql</code> a bien été exécuté, puis reconnectez-vous.</p>
         <button class="btn primary" id="logout-now">Se déconnecter</button></div></div>`;
-      document.getElementById('logout-now').addEventListener('click', () => sb.auth.signOut());
+      document.getElementById('logout-now').addEventListener('click', logout);
       return;
     }
     profile = data;
   }
+
+  startAppSession();
+  if (profile.status && profile.status !== 'approuve') return renderBlocked();
 
   if (hash === '#/connexion' || hash === '#/inscription') hash = '#/';
   renderShell(hash);
@@ -288,7 +318,7 @@ function renderShell(hash) {
       </div>
     </div>`;
 
-  document.getElementById('logout').addEventListener('click', () => sb.auth.signOut());
+  document.getElementById('logout').addEventListener('click', logout);
   const sidebar = document.getElementById('sidebar');
   document.getElementById('menu').addEventListener('click', () => {
     sidebar.classList.add('open');
@@ -297,6 +327,74 @@ function renderShell(hash) {
     document.body.append(scrim);
   });
   document.querySelectorAll('.scrim').forEach(s => s.remove());
+}
+
+// Compte en attente d'approbation ou suspendu : aucun accès à la plateforme.
+function renderBlocked() {
+  const pending = profile.status === 'en_attente';
+  app.innerHTML = `<div class="auth-panel" style="min-height:100vh"><div class="card auth-card stack" style="text-align:center">
+    <div style="font-size:2.6rem">${pending ? '⏳' : '⛔'}</div>
+    <h2>${pending ? 'Inscription en attente de validation' : 'Compte suspendu'}</h2>
+    <p class="muted">${pending
+      ? `Merci ${esc(firstName(profile.full_name))} ! Votre compte doit être approuvé par l’administrateur avant
+         que vous puissiez accéder aux webinaires. Revenez un peu plus tard.`
+      : 'Votre accès à la plateforme a été suspendu. Contactez l’administrateur pour plus d’informations.'}</p>
+    <div class="row" style="justify-content:center">
+      <button class="btn" id="recheck">Vérifier à nouveau</button>
+      <button class="btn primary" id="logout-now">Se déconnecter</button>
+    </div></div></div>`;
+  document.getElementById('recheck').addEventListener('click', () => { profile = null; route(); });
+  document.getElementById('logout-now').addEventListener('click', logout);
+}
+
+// =====================================================================
+// Connexions à la plateforme (date, heure et durée de chaque visite)
+// =====================================================================
+
+let appSession = { id: null, timer: null, pending: false };
+
+async function startAppSession() {
+  if (appSession.id || appSession.pending) return;
+  appSession.pending = true;
+  const { data, error } = await sb.rpc('session_start', { agent: navigator.userAgent.slice(0, 200) });
+  appSession.pending = false;
+  if (error) return console.error(error);
+  appSession.id = data;
+  appSession.timer = setInterval(async () => {
+    const { data: active, error: err } = await sb.rpc('session_ping', { sid: appSession.id });
+    if (err || !profile) return;
+    // Compte approuvé ou suspendu pendant la visite : on recharge le profil.
+    if ((active === true) !== (profile.status === 'approuve')) {
+      profile = null;
+      route();
+    }
+  }, SESSION_PING_MS);
+}
+
+async function endAppSession() {
+  clearInterval(appSession.timer);
+  if (appSession.id) await sb.rpc('session_end', { sid: appSession.id });
+  appSession = { id: null, timer: null, pending: false };
+}
+
+async function logout() {
+  await endAppSession();
+  await sb.auth.signOut();
+}
+
+// Appel envoyé même si l'onglet se ferme (fetch keepalive).
+function keepaliveRpc(name, body) {
+  if (!session) return;
+  fetch(`${CONFIG.supabaseUrl}/rest/v1/rpc/${name}`, {
+    method: 'POST',
+    keepalive: true,
+    headers: {
+      apikey: CONFIG.supabaseKey,
+      Authorization: `Bearer ${session.access_token}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(body)
+  });
 }
 
 function renderSetup() {
@@ -313,7 +411,8 @@ function renderSetup() {
 function renderAuth(mode) {
   const titles = {
     login: ['Bon retour 👋', 'Connectez-vous à votre espace.'],
-    signup: ['Créer un compte', 'Les apprenants s’inscrivent ici. Les encadreurs utilisent l’e-mail invité par l’administrateur.'],
+    signup: ['Créer un compte', 'Les apprenants s’inscrivent ici ; leur compte est ensuite validé par l’administrateur. ' +
+      'Les encadreurs utilisent l’e-mail invité par l’administrateur.'],
     forgot: ['Mot de passe oublié', 'Recevez un lien pour choisir un nouveau mot de passe.']
   };
   const [title, subtitle] = titles[mode];
@@ -414,18 +513,25 @@ async function viewDashboard(view, token) {
     let stats = '';
     let upcoming = [];
     let extra = '';
+    let alertHtml = '';
 
     if (profile.role === 'admin') {
       const head = { count: 'exact', head: true };
-      const [enc, app_, web, live, res] = await Promise.all([
+      const [enc, app_, waiting, web, live, res] = await Promise.all([
         count(sb.from('profiles').select('id', head).eq('role', 'encadreur')),
         count(sb.from('profiles').select('id', head).eq('role', 'apprenant')),
+        count(sb.from('profiles').select('id', head).eq('status', 'en_attente')),
         count(sb.from('webinars').select('id', head).neq('status', 'annule')),
         count(sb.from('webinars').select('id', head).eq('status', 'en_direct')),
         count(sb.from('resources').select('id', head))
       ]);
+      if (waiting) {
+        alertHtml = `<a class="notice warn" href="#/utilisateurs" style="display:block;margin-bottom:24px">
+          ⏳ ${waiting} inscription${waiting > 1 ? 's' : ''} en attente de validation → Voir</a>`;
+      }
       stats = statCard('🧑‍🏫', 'Encadreurs', enc) + statCard('🎓', 'Apprenants', app_) +
-        statCard('🎥', 'Webinaires', web) + statCard('🔴', 'En direct', live) + statCard('📚', 'Ressources', res);
+        statCard('⏳', 'En attente', waiting) + statCard('🎥', 'Webinaires', web) +
+        statCard('🔴', 'En direct', live) + statCard('📚', 'Ressources', res);
       const { data, error } = await sb.from('webinars').select(WEBINAR_SELECT)
         .in('status', ['planifie', 'en_direct']).gte('ends_at', now).order('starts_at').limit(6);
       if (error) throw error;
@@ -476,6 +582,7 @@ async function viewDashboard(view, token) {
         ${isStaff() ? '<a class="btn primary" href="#/webinaires/nouveau">＋ Nouveau webinaire</a>' :
           '<a class="btn primary" href="#/webinaires">Voir les webinaires</a>'}
       </div>
+      ${alertHtml}
       <div class="stats">${stats}</div>
       <h2>${profile.role === 'apprenant' ? 'Mes prochains webinaires' : 'Prochains webinaires'}</h2>
       ${upcoming.length ? `<div class="grid">${upcoming.map(w => webinarCard(w, { registered: profile.role === 'apprenant' })).join('')}</div>` :
@@ -1066,17 +1173,8 @@ function kickOut(message) {
 
 // Fermeture de l'onglet : on enregistre l'heure de départ sans attendre la réponse.
 window.addEventListener('pagehide', () => {
-  if (!room.sessionId || !session) return;
-  fetch(`${CONFIG.supabaseUrl}/rest/v1/rpc/attendance_leave`, {
-    method: 'POST',
-    keepalive: true,
-    headers: {
-      apikey: CONFIG.supabaseKey,
-      Authorization: `Bearer ${session.access_token}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ session_id: room.sessionId })
-  });
+  if (room.sessionId) keepaliveRpc('attendance_leave', { session_id: room.sessionId });
+  if (appSession.id) keepaliveRpc('session_end', { sid: appSession.id });
 });
 
 function onWebinarUpdate(next) {
@@ -1616,7 +1714,6 @@ async function openResource(r, type) {
     openModal(`<h2>${esc(r.title || r.file_name)}</h2>
       <video controls autoplay src="${esc(data.signedUrl)}"></video>
       <div class="actions"><button class="btn" data-close>Fermer</button></div>`, { wide: true });
-    modal.addEventListener('close', () => { const v = modal.querySelector('video'); if (v) v.pause(); }, { once: true });
   } else if (win) {
     win.location = data.signedUrl;
   } else {
@@ -1793,8 +1890,17 @@ async function viewAdmin(view, token) {
 
   const known = new Set(users.map(u => u.email));
   const pending = invites.filter(i => !known.has(i.email));
-  let filter = 'encadreur';
+  const waiting = users.filter(u => u.status === 'en_attente').length;
+  let filter = waiting ? 'en_attente' : 'tous';
   let search = '';
+  const filters = [
+    ['en_attente', 'En attente', u => u.status === 'en_attente'],
+    ['encadreur', 'Encadreurs', u => u.role === 'encadreur'],
+    ['apprenant', 'Apprenants', u => u.role === 'apprenant'],
+    ['admin', 'Administrateurs', u => u.role === 'admin'],
+    ['suspendu', 'Suspendus', u => u.status === 'suspendu'],
+    ['tous', 'Tous', () => true]
+  ];
 
   view.innerHTML = `
     <div class="page-head">
@@ -1825,26 +1931,47 @@ async function viewAdmin(view, token) {
     </div>
     <div class="card">
       <div class="toolbar" style="margin-bottom:12px">
-        <div class="chips" id="filters">${['encadreur', 'apprenant', 'admin', 'tous'].map(k =>
-          `<button class="chip ${k === filter ? 'active' : ''}" data-filter="${k}">${k === 'tous' ? 'Tous' : ROLE_LABELS[k] + 's'}</button>`).join('')}</div>
+        <div class="chips" id="filters">${filters.map(([k, l, fn]) =>
+          `<button class="chip ${k === filter ? 'active' : ''}" data-filter="${k}">${l} (${users.filter(fn).length})</button>`).join('')}</div>
         <input class="search" id="search" type="search" placeholder="Rechercher…">
       </div>
       <div id="users"></div>
     </div>`;
 
+  const refreshCounts = () => view.querySelectorAll('#filters [data-filter]').forEach(b => {
+    const [, l, fn] = filters.find(f => f[0] === b.dataset.filter);
+    b.textContent = `${l} (${users.filter(fn).length})`;
+  });
+
   const draw = () => {
-    const list = users.filter(u => (filter === 'tous' || u.role === filter) &&
+    const match = filters.find(f => f[0] === filter)[2];
+    const list = users.filter(u => match(u) &&
       (!search || `${u.full_name} ${u.email}`.toLowerCase().includes(search)));
     view.querySelector('#users').innerHTML = list.length ? `<div class="table-wrap"><table>
-      <thead><tr><th>Nom</th><th>E-mail</th><th>Inscrit le</th><th>Rôle</th></tr></thead>
+      <thead><tr><th>Nom</th><th>Statut</th><th>Inscrit le</th><th>Dernière connexion</th><th>Rôle</th><th></th></tr></thead>
       <tbody>${list.map(u => `<tr>
-        <td><div class="row"><div class="avatar sm">${esc(initials(u.full_name || u.email))}</div>${esc(u.full_name)}</div></td>
-        <td class="muted">${esc(u.email)}</td>
+        <td><button class="btn ghost" data-view="${u.id}" style="padding:0;text-align:left;color:inherit">
+          <div class="row" style="flex-wrap:nowrap"><div class="avatar sm">${esc(initials(u.full_name || u.email))}</div>
+          <div><div style="font-weight:600">${esc(u.full_name || '—')}</div><div class="muted small">${esc(u.email)}</div></div></div>
+        </button></td>
+        <td>${accountBadge(u.status)}</td>
         <td>${esc(fmtShortDate(u.created_at))}</td>
+        <td>${fmtRelative(u.last_seen_at) === 'En ligne' ? '<span class="badge ok">● En ligne</span>' : esc(fmtRelative(u.last_seen_at))}</td>
         <td>${u.id === profile.id ? `<span class="badge">${ROLE_LABELS[u.role]} (vous)</span>` :
-          `<select data-role="${u.id}" style="margin:0;max-width:170px">${Object.entries(ROLE_LABELS).map(([k, l]) =>
+          `<select data-role="${u.id}" style="margin:0;max-width:160px">${Object.entries(ROLE_LABELS).map(([k, l]) =>
             `<option value="${k}" ${u.role === k ? 'selected' : ''}>${l}</option>`).join('')}</select>`}</td>
+        <td><div class="row" style="flex-wrap:nowrap;justify-content:flex-end">
+          ${u.id === profile.id ? '' : statusButton(u)}
+          <button class="btn sm" data-view="${u.id}">Voir</button>
+        </div></td>
       </tr>`).join('')}</tbody></table></div>` : emptyState('👥', 'Aucun utilisateur dans cette catégorie.');
+
+    view.querySelectorAll('[data-view]').forEach(b => b.addEventListener('click', () =>
+      showUserProfile(users.find(x => x.id === b.dataset.view), () => { refreshCounts(); draw(); })));
+    view.querySelectorAll('[data-status]').forEach(b => b.addEventListener('click', async () => {
+      const u = users.find(x => x.id === b.dataset.id);
+      if (await setUserStatus(u, b.dataset.status)) { refreshCounts(); draw(); }
+    }));
     view.querySelectorAll('[data-role]').forEach(s => s.addEventListener('change', async () => {
       const u = users.find(x => x.id === s.dataset.role);
       const ok = await confirmDialog(`Passer ${u.full_name || u.email} en « ${ROLE_LABELS[s.value]} » ?`);
@@ -1891,6 +2018,127 @@ async function viewAdmin(view, token) {
   }));
 }
 
+function statusButton(u) {
+  if (u.status === 'en_attente') return `<button class="btn primary sm" data-status="approuve" data-id="${u.id}">✓ Approuver</button>`;
+  if (u.status === 'suspendu') return `<button class="btn sm" data-status="approuve" data-id="${u.id}">Réactiver</button>`;
+  return `<button class="btn danger sm" data-status="suspendu" data-id="${u.id}">Suspendre</button>`;
+}
+
+async function setUserStatus(u, status) {
+  const name = u.full_name || u.email;
+  if (status === 'suspendu' && !await confirmDialog(`Suspendre le compte de ${name} ?`, {
+    confirmLabel: 'Suspendre', danger: true
+  })) return false;
+  const { error } = await sb.rpc('set_user_status', { target: u.id, new_status: status });
+  if (error) { fail(error); return false; }
+  const message = status === 'suspendu' ? `Compte de ${name} suspendu.`
+    : u.status === 'suspendu' ? `Compte de ${name} réactivé ✓` : `Inscription de ${name} approuvée ✓`;
+  u.status = status;
+  toast(message, 'success');
+  return true;
+}
+
+// Fiche d'un utilisateur : informations, connexions à la plateforme, webinaires.
+async function showUserProfile(u, onChange) {
+  openModal(loading(), { wide: true });
+  const [sess, regs, att, owned] = await Promise.all([
+    sb.from('app_sessions').select('*').eq('user_id', u.id).order('started_at', { ascending: false }).limit(300),
+    sb.from('registrations').select('registered_at, excluded, webinar:webinars(id, title, starts_at, status)').eq('apprenant_id', u.id),
+    sb.from('attendance').select('webinar_id, joined_at, last_seen_at, left_at').eq('user_id', u.id),
+    sb.from('webinars').select('id, title, starts_at, status').eq('encadreur_id', u.id).order('starts_at', { ascending: false })
+  ]);
+  const error = sess.error || regs.error || att.error || owned.error;
+  if (error) { closeModal(); return fail(error); }
+  if (!modal.open) return;
+
+  const now = Date.now();
+  const sessions = sess.data.map(s => {
+    const online = !s.ended_at && now - new Date(s.last_seen_at).getTime() < 2 * SESSION_PING_MS;
+    const end = s.ended_at || s.last_seen_at;
+    return { ...s, online, end, duration: (online ? now : new Date(end).getTime()) - new Date(s.started_at).getTime() };
+  });
+  const total = sessions.reduce((n, s) => n + s.duration, 0);
+  const presence = new Map();
+  att.data.forEach(a => {
+    const d = new Date(a.left_at || a.last_seen_at).getTime() - new Date(a.joined_at).getTime();
+    presence.set(a.webinar_id, (presence.get(a.webinar_id) || 0) + Math.max(0, d));
+  });
+  const regRows = regs.data.filter(r => r.webinar).sort((a, b) => b.webinar.starts_at.localeCompare(a.webinar.starts_at));
+
+  openModal(`
+    <div class="row spread">
+      <div class="row" style="flex-wrap:nowrap">
+        <div class="avatar" style="width:56px;height:56px;font-size:1.1rem">${esc(initials(u.full_name || u.email))}</div>
+        <div><h2 style="margin:0">${esc(u.full_name || '—')}</h2>
+          <div class="muted">${esc(u.email)}</div>
+          <div class="row" style="margin-top:6px">${accountBadge(u.status)}<span class="badge">${ROLE_LABELS[u.role]}</span></div></div>
+      </div>
+      <button class="btn ghost" data-close aria-label="Fermer">✕</button>
+    </div>
+    <div class="info-grid">
+      <div><div class="k">Inscrit le</div><div class="v">${esc(fmtShortDate(u.created_at))} à ${esc(fmtTime(u.created_at))}</div></div>
+      <div><div class="k">Dernière connexion</div><div class="v">${esc(fmtRelative(u.last_seen_at))}</div></div>
+      <div><div class="k">Connexions</div><div class="v">${sessions.length}</div></div>
+      <div><div class="k">Temps total connecté</div><div class="v">${esc(fmtDuration(total))}</div></div>
+    </div>
+    <div>
+      <div class="tabs">
+        <button class="active" data-ptab="sessions">🕒 Connexions (${sessions.length})</button>
+        <button data-ptab="webinars">🎥 Webinaires (${u.role === 'apprenant' ? regRows.length : owned.data.length})</button>
+      </div>
+      <div id="ptab-sessions" class="table-wrap" style="max-height:320px;overflow-y:auto">
+        ${sessions.length ? `<table>
+          <thead><tr><th>Date</th><th>Connexion</th><th>Déconnexion</th><th>Durée</th></tr></thead>
+          <tbody>${sessions.map(s => `<tr>
+            <td>${esc(fmtShortDate(s.started_at))}</td>
+            <td>${esc(fmtTime(s.started_at))}</td>
+            <td>${s.online ? '<span class="badge ok">● En ligne</span>' : esc(fmtTime(s.end))}</td>
+            <td>${esc(fmtDuration(s.duration))}</td>
+          </tr>`).join('')}</tbody></table>` : emptyState('🕒', 'Aucune connexion enregistrée.')}
+      </div>
+      <div id="ptab-webinars" class="table-wrap" hidden style="max-height:320px;overflow-y:auto">
+        ${u.role === 'apprenant' ? (regRows.length ? `<table>
+          <thead><tr><th>Webinaire</th><th>Date</th><th>Inscription</th><th>Présence</th></tr></thead>
+          <tbody>${regRows.map(r => `<tr>
+            <td><a href="#/webinaires/${r.webinar.id}" data-close>${esc(r.webinar.title)}</a></td>
+            <td>${esc(fmtShortDate(r.webinar.starts_at))}</td>
+            <td>${r.excluded ? '<span class="badge cancel">Exclu</span>' : '<span class="badge ok">Inscrit</span>'}</td>
+            <td>${presence.has(r.webinar.id) ? esc(fmtDuration(presence.get(r.webinar.id))) :
+              r.webinar.status === 'termine' ? '<span class="badge cancel">Absent</span>' : '—'}</td>
+          </tr>`).join('')}</tbody></table>` : emptyState('🎥', 'Aucune inscription.'))
+        : (owned.data.length ? `<table>
+          <thead><tr><th>Webinaire animé</th><th>Date</th><th>Statut</th></tr></thead>
+          <tbody>${owned.data.map(w => `<tr>
+            <td><a href="#/webinaires/${w.id}" data-close>${esc(w.title)}</a></td>
+            <td>${esc(fmtShortDate(w.starts_at))}</td>
+            <td>${esc(STATUS_LABELS[w.status])}</td>
+          </tr>`).join('')}</tbody></table>` : emptyState('🎥', 'Aucun webinaire animé.'))}
+      </div>
+    </div>
+    <div class="actions">
+      ${sessions.length ? '<button class="btn" id="export-sessions">⬇️ Exporter les connexions</button>' : ''}
+      ${u.id === profile.id ? '' : statusButton(u)}
+    </div>`, { wide: true });
+
+  modal.querySelectorAll('[data-ptab]').forEach(b => b.addEventListener('click', () => {
+    modal.querySelectorAll('[data-ptab]').forEach(x => x.classList.toggle('active', x === b));
+    modal.querySelector('#ptab-sessions').hidden = b.dataset.ptab !== 'sessions';
+    modal.querySelector('#ptab-webinars').hidden = b.dataset.ptab !== 'webinars';
+  }));
+  const exp = modal.querySelector('#export-sessions');
+  if (exp) exp.addEventListener('click', () => downloadCsv(`connexions-${slug(u.full_name || u.email)}.csv`, [
+    ['Nom', 'E-mail', 'Date', 'Heure de connexion', 'Heure de déconnexion', 'Durée'],
+    ...sessions.map(s => [u.full_name, u.email, fmtShortDate(s.started_at), fmtTime(s.started_at),
+      s.online ? 'en ligne' : fmtTime(s.end), fmtDuration(s.duration)])
+  ]));
+  const statusBtn = modal.querySelector('[data-status]');
+  if (statusBtn) statusBtn.addEventListener('click', async () => {
+    if (!await setUserStatus(u, statusBtn.dataset.status)) return;
+    if (onChange) onChange();
+    showUserProfile(u, onChange);
+  });
+}
+
 function shareInvite(email, name, onClose) {
   const text = `Bonjour ${name || ''},\n\nVous avez désormais un accès encadreur à la plateforme WEBINAIRE.\n` +
     `Créez votre compte ici : ${SITE_URL}#/inscription\nUtilisez impérativement l'adresse : ${email}\n\nÀ bientôt !`;
@@ -1906,7 +2154,7 @@ function shareInvite(email, name, onClose) {
     await navigator.clipboard.writeText(text);
     toast('Message copié ✓', 'success');
   });
-  if (onClose) modal.addEventListener('close', onClose, { once: true });
+  if (onClose) onModalClose = onClose;
 }
 
 // =====================================================================
@@ -1960,6 +2208,8 @@ if (configured) {
   sb.auth.onAuthStateChange((event, s) => {
     // Pas d'appel Supabase directement ici (recommandation de supabase-js).
     if (event === 'SIGNED_OUT') {
+      clearInterval(appSession.timer);
+      appSession = { id: null, timer: null, pending: false };
       session = null;
       profile = null;
       setTimeout(route, 0);

@@ -9,12 +9,14 @@ Site : <https://fallthionakh.github.io/WEBINAIRE/>
 
 | Rôle | Ce qu'il peut faire |
 |---|---|
-| 👑 Administrateur | Donne l'accès encadreur (par e-mail), change les rôles, voit et gère tous les webinaires |
+| 👑 Administrateur | Approuve ou suspend les comptes, donne l'accès encadreur (par e-mail), change les rôles, consulte la fiche de chaque utilisateur (connexions, durées, webinaires), voit et gère tous les webinaires |
 | 🧑‍🏫 Encadreur | Crée, reprogramme et annule ses webinaires ; voit les inscrits et les présents ; exclut ou réintègre un apprenant ; dépose des ressources |
 | 🎓 Apprenant | Crée son compte, s'inscrit à un ou plusieurs webinaires, rejoint le direct, consulte la bibliothèque |
 
 ## Fonctionnalités
 
+- **Validation des comptes** : un apprenant qui s'inscrit reste « en attente » jusqu'à l'approbation de l'administrateur ; un compte suspendu perd immédiatement l'accès. Les encadreurs invités sont approuvés d'office.
+- **Historique des connexions** : chaque visite est enregistrée (date, heure de connexion, heure de déconnexion, durée), avec la dernière connexion et le temps total, exportable en CSV.
 - **Webinaires** : titre, description, date, heure de début, durée et heure de fin (calculées l'une de l'autre), reprogrammation (badge « Reprogrammé »), annulation avec motif.
 - **Salle en direct** : caméra, partage d'écran, présentation PDF ou images (◀ ▶, flèches du clavier, depuis la bibliothèque), plein écran ; chat, questions et sondages en temps réel ; liste des participants en ligne avec bouton « Exclure ».
 - **Liste de présence automatique** : chaque connexion est enregistrée par le serveur (date, heure de connexion, heure de déconnexion, durée), avec le total par apprenant et les absents. Export Excel / CSV.
@@ -39,7 +41,7 @@ passe n'est stocké dans le code.
 ## Installation
 
 1. Créer un projet sur [supabase.com](https://supabase.com) (offre gratuite).
-2. Dans **SQL Editor**, exécuter `supabase/schema.sql`.
+2. Dans **SQL Editor**, exécuter `supabase/schema.sql`, puis `supabase/002_approbation_connexions.sql`.
 3. Dans **Authentication → Sign In / Providers → Email**, désactiver *Confirm email*
    (ou configurer un serveur SMTP pour garder la confirmation).
 4. Dans **Authentication → Users → Add user**, créer le compte administrateur
