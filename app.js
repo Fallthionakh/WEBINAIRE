@@ -111,7 +111,8 @@ function isStaff() {
 }
 
 function translateError(error) {
-  const msg = (error && (error.message || error.error_description)) || String(error || '');
+  const msg = (error && (error.message || error.error_description || error.errorMsg || error.error?.msg)) ||
+    (typeof error === 'string' ? error : 'Erreur inattendue.');
   const map = [
     [/Invalid login credentials/i, 'E-mail ou mot de passe incorrect.'],
     [/already registered|already been registered/i, 'Un compte existe déjà avec cet e-mail.'],
@@ -1358,12 +1359,25 @@ async function startVideo() {
     lang: 'fr'
   });
   room.video = 'on';
-  room.call.on('error', e => toast(`Visio : ${e?.errorMsg || 'erreur'}`, 'error'));
+  room.call.on('error', e => videoFailed(id, e?.errorMsg || e?.error?.type));
   try {
     await room.call.join({ url: auth.url, token: auth.token });
   } catch (err) {
-    fail(err);
+    videoFailed(id, err?.errorMsg || err?.error?.type || err?.message);
   }
+}
+
+// Erreur Daily (compte, réseau…) : on ferme la visio et on revient au mode local,
+// sans laisser l'écran d'erreur de Daily (dont le lien mène à son espace d'administration).
+function videoFailed(id, code) {
+  if (room.id !== id || room.video === 'off') return;
+  console.warn('Erreur Daily :', code);
+  stopVideo();
+  room.video = 'off';
+  room.videoError = /payment/i.test(code || '')
+    ? 'le compte Daily doit avoir un moyen de paiement enregistré : Daily → Billing'
+    : (code || 'erreur inconnue');
+  renderRoomView();
 }
 
 function stopVideo() {
