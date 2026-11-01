@@ -277,6 +277,7 @@ async function route() {
   if (hash === '#/bibliotheque') return viewLibrary(view, token);
   if (hash === '#/utilisateurs' && profile.role === 'admin') return viewAdmin(view, token);
   if (hash === '#/profil') return viewProfile(view, token);
+  if (hash === '#/mes-inscriptions' && profile.role === 'apprenant') return viewMyRegistrations(view, token);
   location.hash = '#/';
 }
 
@@ -286,6 +287,7 @@ function renderShell(hash) {
     ['#/webinaires', '🎥', 'Webinaires'],
     ['#/bibliotheque', '📚', 'Bibliothèque']
   ];
+  if (profile.role === 'apprenant') links.splice(2, 0, ['#/mes-inscriptions', '📝', 'Mes inscriptions']);
   if (profile.role === 'admin') links.push(['#/utilisateurs', '👥', 'Utilisateurs']);
   links.push(['#/profil', '⚙️', 'Mon profil']);
 
@@ -514,6 +516,8 @@ async function viewDashboard(view, token) {
     let upcoming = [];
     let extra = '';
     let alertHtml = '';
+    let pendingMap = new Map();
+    const regMap = new Map();
 
     if (profile.role === 'admin') {
       const head = { count: 'exact', head: true };
@@ -540,34 +544,51 @@ async function viewDashboard(view, token) {
       const { data, error } = await sb.from('webinars').select(WEBINAR_SELECT + ', registrations(count)')
         .eq('encadreur_id', profile.id).order('starts_at');
       if (error) throw error;
-      const res = await count(sb.from('resources').select('id', { count: 'exact', head: true }).eq('owner_id', profile.id));
+      const [res, pending] = await Promise.all([
+        count(sb.from('resources').select('id', { count: 'exact', head: true }).eq('owner_id', profile.id)),
+        pendingRegistrations()
+      ]);
+      pendingMap = pending;
       const next = data.filter(w => ['planifie', 'en_direct'].includes(w.status) && w.ends_at >= now);
       const inscrits = next.reduce((n, w) => n + (w.registrations[0]?.count || 0), 0);
+      const waiting = [...pending.values()].reduce((a, b) => a + b, 0);
+      if (waiting) {
+        alertHtml = `<a class="notice warn" href="#/webinaires" style="display:block;margin-bottom:24px">
+          ⏳ ${waiting} demande${waiting > 1 ? 's' : ''} d’inscription à valider → ouvrez le webinaire concerné</a>`;
+      }
       stats = statCard('📅', 'Webinaires à venir', next.length) + statCard('🎓', 'Inscriptions à venir', inscrits) +
+        statCard('⏳', 'Demandes à valider', waiting) +
         statCard('✅', 'Webinaires terminés', data.filter(w => w.status === 'termine').length) +
         statCard('📚', 'Ressources déposées', res);
       upcoming = next.slice(0, 6);
     } else {
       const [{ data: regs, error }, res] = await Promise.all([
-        sb.from('registrations').select('excluded, webinar:webinars(' + WEBINAR_SELECT + ')').eq('apprenant_id', profile.id),
+        sb.from('registrations').select('status, webinar:webinars(' + WEBINAR_SELECT + ')').eq('apprenant_id', profile.id),
         count(sb.from('resources').select('id', { count: 'exact', head: true }))
       ]);
       if (error) throw error;
-      const mine = regs.filter(r => r.webinar && !r.excluded).map(r => r.webinar);
+      regs.forEach(r => r.webinar && regMap.set(r.webinar.id, r));
+      const mine = regs.filter(r => r.webinar && r.status !== 'suspendu').map(r => r.webinar);
       const next = mine.filter(w => ['planifie', 'en_direct'].includes(w.status) && w.ends_at >= now)
         .sort((a, b) => a.starts_at.localeCompare(b.starts_at));
       const { data: attended } = await sb.from('attendance').select('webinar_id').eq('user_id', profile.id);
+      const waiting = regs.filter(r => r.webinar && r.status === 'en_attente').length;
+      if (waiting) {
+        alertHtml = `<a class="notice warn" href="#/mes-inscriptions" style="display:block;margin-bottom:24px">
+          ⏳ ${waiting} inscription${waiting > 1 ? 's' : ''} en attente de validation par l’encadreur → Mes inscriptions</a>`;
+      }
       stats = statCard('📅', 'Mes webinaires à venir', next.length) +
         statCard('✅', 'Webinaires suivis', new Set((attended || []).map(a => a.webinar_id)).size) +
         statCard('📚', 'Ressources disponibles', res);
       upcoming = next.slice(0, 6);
 
-      const registered = new Set(mine.map(w => w.id));
+      const registered = new Set(regs.filter(r => r.webinar).map(r => r.webinar.id));
       const { data: open } = await sb.from('webinars').select(WEBINAR_SELECT)
         .in('status', ['planifie', 'en_direct']).gte('ends_at', now).order('starts_at').limit(12);
       const discover = (open || []).filter(w => !registered.has(w.id)).slice(0, 3);
       if (discover.length) {
-        extra = `<h2 style="margin-top:32px">À découvrir</h2><div class="grid">${discover.map(w => webinarCard(w)).join('')}</div>`;
+        extra = `<h2 style="margin-top:32px">À découvrir</h2><div class="grid">${discover.map(w =>
+          webinarCard(w, { showActions: true })).join('')}</div>`;
       }
     }
     if (isStale(token)) return;
@@ -585,10 +606,12 @@ async function viewDashboard(view, token) {
       ${alertHtml}
       <div class="stats">${stats}</div>
       <h2>${profile.role === 'apprenant' ? 'Mes prochains webinaires' : 'Prochains webinaires'}</h2>
-      ${upcoming.length ? `<div class="grid">${upcoming.map(w => webinarCard(w, { registered: profile.role === 'apprenant' })).join('')}</div>` :
+      ${upcoming.length ? `<div class="grid">${upcoming.map(w => webinarCard(w, {
+          reg: regMap.get(w.id), pending: pendingMap.get(w.id) || 0 })).join('')}</div>` :
         `<div class="card">${emptyState('🗓️', profile.role === 'apprenant' ?
           'Vous n’êtes inscrit à aucun webinaire à venir.' : 'Aucun webinaire à venir.')}</div>`}
       ${extra}`;
+    bindRegisterButtons(view, regMap, () => route());
   } catch (err) {
     if (!isStale(token)) view.innerHTML = `<div class="notice danger">${esc(translateError(err))}</div>`;
   }
@@ -598,19 +621,37 @@ async function viewDashboard(view, token) {
 // Webinaires : liste, création, reprogrammation, détail
 // =====================================================================
 
-function webinarCard(w, { registered = false, excluded = false, showActions = false } = {}) {
+// Statut d'une inscription à un webinaire.
+const REG_STATUS = { en_attente: ['⏳ En attente', 'warn'], approuve: ['✓ Inscrit', 'ok'], suspendu: ['Suspendu', 'cancel'] };
+
+function regBadge(status) {
+  const [label, cls] = REG_STATUS[status] || REG_STATUS.en_attente;
+  return `<span class="badge ${cls}">${label}</span>`;
+}
+
+// Demandes d'inscription en attente par webinaire (limitées par la base aux webinaires gérés).
+async function pendingRegistrations() {
+  const { data } = await sb.from('registrations').select('webinar_id').eq('status', 'en_attente');
+  const map = new Map();
+  (data || []).forEach(r => map.set(r.webinar_id, (map.get(r.webinar_id) || 0) + 1));
+  return map;
+}
+
+function webinarCard(w, { reg = null, pending = 0, showActions = false } = {}) {
   const inscrits = w.registrations ? (w.registrations[0]?.count || 0) : null;
+  const open = ['planifie', 'en_direct'].includes(w.status);
   let action = `<a class="btn sm" href="#/webinaires/${w.id}">Détails</a>`;
-  if (w.status === 'en_direct' && (canManage(w) || (registered && !excluded))) {
+  if (w.status === 'en_direct' && (canManage(w) || reg?.status === 'approuve')) {
     action = `<a class="btn live sm" href="#/salle/${w.id}">Rejoindre</a>`;
-  } else if (showActions && profile.role === 'apprenant' && ['planifie', 'en_direct'].includes(w.status) && !excluded) {
-    action = registered
-      ? `<button class="btn sm" data-unregister="${w.id}">✓ Inscrit</button>`
+  } else if (showActions && profile.role === 'apprenant' && open && reg?.status !== 'suspendu') {
+    action = reg
+      ? `<button class="btn sm" data-unregister="${w.id}" title="Annuler mon inscription">Se désinscrire</button>`
       : `<button class="btn primary sm" data-register="${w.id}">S'inscrire</button>`;
   }
   return `
     <article class="card wcard">
-      <div class="row spread">${statusBadge(w)}${excluded ? '<span class="badge cancel">Exclu</span>' : ''}</div>
+      <div class="row spread"><div class="row">${statusBadge(w)}</div>
+        ${reg ? regBadge(reg.status) : ''}</div>
       <div class="when">
         ${dateBox(w.starts_at)}
         <div>
@@ -619,6 +660,8 @@ function webinarCard(w, { registered = false, excluded = false, showActions = fa
         </div>
       </div>
       ${w.description ? `<p class="muted small clamp">${esc(w.description)}</p>` : ''}
+      ${pending ? `<button class="notice warn" data-pending="${w.id}" style="border:0;font:inherit;text-align:left;cursor:pointer">
+        ⏳ <strong>${pending} apprenant${pending > 1 ? 's' : ''}</strong> attend${pending > 1 ? 'ent' : ''} votre validation → Voir</button>` : ''}
       <div class="foot">
         <span class="muted small">🧑‍🏫 ${esc(w.encadreur?.full_name || '')}${inscrits !== null ? ` · 🎓 ${inscrits}` : ''}</span>
         ${action}
@@ -629,11 +672,12 @@ function webinarCard(w, { registered = false, excluded = false, showActions = fa
 async function viewWebinars(view, token) {
   let query = sb.from('webinars').select(WEBINAR_SELECT + (isStaff() ? ', registrations(count)' : '')).order('starts_at');
   if (profile.role === 'encadreur') query = query.eq('encadreur_id', profile.id);
-  const [{ data: webinars, error }, regs] = await Promise.all([
+  const [{ data: webinars, error }, regs, pendingMap] = await Promise.all([
     query,
     profile.role === 'apprenant'
-      ? sb.from('registrations').select('webinar_id, excluded').eq('apprenant_id', profile.id)
-      : Promise.resolve({ data: [] })
+      ? sb.from('registrations').select('webinar_id, status').eq('apprenant_id', profile.id)
+      : Promise.resolve({ data: [] }),
+    isStaff() ? pendingRegistrations() : Promise.resolve(new Map())
   ]);
   if (isStale(token)) return;
   if (error) return (view.innerHTML = `<div class="notice danger">${esc(translateError(error))}</div>`);
@@ -676,11 +720,12 @@ async function viewWebinars(view, token) {
     document.getElementById('results').innerHTML = list.length
       ? `<div class="grid">${list.map(w => {
           const reg = regMap.get(w.id);
-          return webinarCard(w, { registered: !!reg, excluded: reg?.excluded, showActions: true });
+          return webinarCard(w, { reg, pending: pendingMap.get(w.id) || 0, showActions: true });
         }).join('')}</div>`
       : `<div class="card">${emptyState('🔍', 'Aucun webinaire dans cette catégorie.')}</div>`;
   };
   draw();
+  bindRegisterButtons(view.querySelector('#results'), regMap, draw);
 
   view.querySelector('#filters').addEventListener('click', e => {
     const b = e.target.closest('[data-filter]');
@@ -690,23 +735,159 @@ async function viewWebinars(view, token) {
     draw();
   });
   view.querySelector('#search').addEventListener('input', e => { search = e.target.value.trim().toLowerCase(); draw(); });
-  view.querySelector('#results').addEventListener('click', async e => {
+}
+
+// Boutons des cartes : « S'inscrire », « Se désinscrire » et demandes à valider.
+function bindRegisterButtons(container, regMap, redraw) {
+  container.addEventListener('click', async e => {
+    const pending = e.target.closest('[data-pending]');
+    if (pending) return pendingDialog(pending.dataset.pending);
     const reg = e.target.closest('[data-register]');
     const unreg = e.target.closest('[data-unregister]');
     if (!reg && !unreg) return;
-    const id = (reg || unreg).dataset.register || (reg || unreg).dataset.unregister;
+    const id = reg ? reg.dataset.register : unreg.dataset.unregister;
     const ok = reg ? await register(id) : await unregister(id);
     if (!ok) return;
-    if (reg) regMap.set(id, { webinar_id: id, excluded: false });
+    if (reg) regMap.set(id, { webinar_id: id, status: 'en_attente' });
     else regMap.delete(id);
+    redraw();
+  });
+}
+
+// Encadreur : valider les demandes d'inscription d'un webinaire sans quitter la liste.
+async function pendingDialog(webinarId) {
+  const { data, error } = await sb.from('registrations')
+    .select('apprenant_id, registered_at, apprenant:profiles!apprenant_id(full_name, email)')
+    .eq('webinar_id', webinarId).eq('status', 'en_attente').order('registered_at');
+  if (error) return fail(error);
+  let changed = false;
+  openModal(`
+    <h2>⏳ Demandes d’inscription à valider</h2>
+    <div class="list" id="pending-list" style="max-height:380px;overflow-y:auto"></div>
+    <div class="actions">
+      <button class="btn" data-close>Fermer</button>
+      <button class="btn primary" id="approve-all-dlg">✓ Tout approuver</button>
+    </div>`);
+  onModalClose = () => { if (changed) route(); };
+
+  const draw = () => {
+    modal.querySelector('#pending-list').innerHTML = data.length ? data.map(r => `
+      <div class="list-item">
+        <div class="avatar sm">${esc(initials(r.apprenant?.full_name))}</div>
+        <div class="grow"><strong>${esc(r.apprenant?.full_name)}</strong>
+          <div class="muted small">${esc(r.apprenant?.email)} · demande du ${esc(fmtShortDate(r.registered_at))} à ${esc(fmtTime(r.registered_at))}</div></div>
+        <button class="btn primary sm" data-decide="approuve" data-user="${r.apprenant_id}">✓ Approuver</button>
+        <button class="btn ghost sm" data-decide="suspendu" data-user="${r.apprenant_id}">Refuser</button>
+      </div>`).join('') : emptyState('✅', 'Toutes les demandes ont été traitées.');
+    modal.querySelector('#approve-all-dlg').hidden = !data.length;
+    modal.querySelectorAll('[data-decide]').forEach(b => b.addEventListener('click', async () => {
+      b.disabled = true;
+      const { error: err } = await sb.from('registrations').update({ status: b.dataset.decide })
+        .eq('webinar_id', webinarId).eq('apprenant_id', b.dataset.user);
+      if (err) { b.disabled = false; return fail(err); }
+      data.splice(data.findIndex(r => r.apprenant_id === b.dataset.user), 1);
+      changed = true;
+      toast(b.dataset.decide === 'approuve' ? 'Inscription approuvée ✓' : 'Demande refusée.', 'success');
+      draw();
+    }));
+  };
+  draw();
+  modal.querySelector('#approve-all-dlg').addEventListener('click', async () => {
+    const { error: err } = await sb.from('registrations').update({ status: 'approuve' })
+      .eq('webinar_id', webinarId).eq('status', 'en_attente');
+    if (err) return fail(err);
+    toast(`${data.length} inscription${data.length > 1 ? 's' : ''} approuvée${data.length > 1 ? 's' : ''} ✓`, 'success');
+    data.length = 0;
+    changed = true;
     draw();
   });
+}
+
+// Apprenant : toutes ses inscriptions, leur statut, sa présence, et les webinaires ouverts.
+async function viewMyRegistrations(view, token) {
+  const now = new Date().toISOString();
+  const [regsRes, openRes, attRes] = await Promise.all([
+    sb.from('registrations').select('status, registered_at, status_changed_at, webinar:webinars(' + WEBINAR_SELECT + ')')
+      .eq('apprenant_id', profile.id),
+    sb.from('webinars').select(WEBINAR_SELECT).in('status', ['planifie', 'en_direct']).gte('ends_at', now).order('starts_at'),
+    sb.from('attendance').select('webinar_id, joined_at, last_seen_at, left_at').eq('user_id', profile.id)
+  ]);
+  if (isStale(token)) return;
+  const error = regsRes.error || openRes.error || attRes.error;
+  if (error) return (view.innerHTML = `<div class="notice danger">${esc(translateError(error))}</div>`);
+
+  const regs = regsRes.data.filter(r => r.webinar)
+    .sort((a, b) => b.webinar.starts_at.localeCompare(a.webinar.starts_at));
+  const regMap = new Map(regs.map(r => [r.webinar.id, r]));
+  const presence = new Map();
+  attRes.data.forEach(a => {
+    const d = new Date(a.left_at || a.last_seen_at).getTime() - new Date(a.joined_at).getTime();
+    presence.set(a.webinar_id, (presence.get(a.webinar_id) || 0) + Math.max(0, d));
+  });
+  const available = openRes.data.filter(w => !regMap.has(w.id));
+  const filters = [
+    ['toutes', 'Toutes', () => true],
+    ['en_attente', 'En attente', r => r.status === 'en_attente'],
+    ['approuve', 'Approuvées', r => r.status === 'approuve'],
+    ['suspendu', 'Suspendues', r => r.status === 'suspendu']
+  ];
+  let filter = 'toutes';
+
+  view.innerHTML = `
+    <div class="page-head">
+      <div><h1>Mes inscriptions</h1>
+        <p class="muted">Suivez vos demandes d’inscription et inscrivez-vous à d’autres webinaires.</p></div>
+    </div>
+    <div class="card">
+      <div class="chips" id="filters" style="margin-bottom:12px">${filters.map(([k, l, fn]) =>
+        `<button class="chip ${k === filter ? 'active' : ''}" data-filter="${k}">${l} (${regs.filter(fn).length})</button>`).join('')}</div>
+      <div id="my-regs"></div>
+    </div>
+    <h2 style="margin-top:32px">S’inscrire à un webinaire</h2>
+    <div id="available">${available.length
+      ? `<div class="grid">${available.map(w => webinarCard(w, { showActions: true })).join('')}</div>`
+      : `<div class="card">${emptyState('🎉', 'Vous êtes déjà inscrit à tous les webinaires à venir.')}</div>`}</div>`;
+
+  const draw = () => {
+    const match = filters.find(f => f[0] === filter)[2];
+    const list = regs.filter(match);
+    view.querySelector('#my-regs').innerHTML = list.length ? `<div class="table-wrap"><table>
+      <thead><tr><th>Webinaire</th><th>Date</th><th>Inscription</th><th>Ma présence</th><th></th></tr></thead>
+      <tbody>${list.map(r => {
+        const w = r.webinar;
+        const open = ['planifie', 'en_direct'].includes(w.status) && w.ends_at >= now;
+        let action = '';
+        if (w.status === 'en_direct' && r.status === 'approuve') action = `<a class="btn live sm" href="#/salle/${w.id}">Rejoindre</a>`;
+        else if (open && r.status !== 'suspendu') action = `<button class="btn ghost sm" data-unregister="${w.id}">Se désinscrire</button>`;
+        return `<tr>
+          <td><a href="#/webinaires/${w.id}"><strong>${esc(w.title)}</strong></a>
+            <div class="muted small">🧑‍🏫 ${esc(w.encadreur?.full_name || '')} · ${statusBadge(w)}</div></td>
+          <td>${esc(fmtShortDate(w.starts_at))}<div class="muted small">${esc(fmtTime(w.starts_at))} – ${esc(fmtTime(w.ends_at))}</div></td>
+          <td>${regBadge(r.status)}<div class="muted small">demandée le ${esc(fmtShortDate(r.registered_at))}</div></td>
+          <td>${presence.has(w.id) ? esc(fmtDuration(presence.get(w.id))) :
+            w.status === 'termine' && r.status === 'approuve' ? '<span class="badge cancel">Absent</span>' : '—'}</td>
+          <td style="text-align:right">${action}</td>
+        </tr>`;
+      }).join('')}</tbody></table></div>` : emptyState('📝', regs.length ? 'Aucune inscription dans cette catégorie.' :
+        'Vous n’êtes inscrit à aucun webinaire. Choisissez-en un ci-dessous.');
+  };
+  draw();
+
+  view.querySelector('#filters').addEventListener('click', e => {
+    const b = e.target.closest('[data-filter]');
+    if (!b) return;
+    filter = b.dataset.filter;
+    view.querySelectorAll('#filters [data-filter]').forEach(x => x.classList.toggle('active', x === b));
+    draw();
+  });
+  // Toute inscription ou désinscription recharge la page pour mettre les deux listes à jour.
+  bindRegisterButtons(view, regMap, () => route());
 }
 
 async function register(id) {
   const { error } = await sb.from('registrations').insert({ webinar_id: id, apprenant_id: profile.id });
   if (error) { fail(error); return false; }
-  toast('Inscription confirmée ✓', 'success');
+  toast('Demande d’inscription envoyée. L’encadreur doit la valider.', 'success');
   return true;
 }
 
@@ -838,7 +1019,9 @@ async function viewWebinarDetail(view, token, id) {
     const { data } = await sb.from('registrations').select('*').eq('webinar_id', id).eq('apprenant_id', profile.id).maybeSingle();
     reg = data;
   }
-  const { data: resources } = await sb.from('resources').select('*').eq('webinar_id', id).order('created_at');
+  const { data: links } = await sb.from('webinar_resources').select('resource:resources(*)')
+    .eq('webinar_id', id).order('created_at');
+  const resources = (links || []).map(l => l.resource).filter(Boolean);
   if (isStale(token)) return;
 
   const open = ['planifie', 'en_direct'].includes(w.status);
@@ -851,20 +1034,27 @@ async function viewWebinarDetail(view, token, id) {
         <button class="btn danger" id="cancel-w">Annuler le webinaire</button>`;
     } else if (w.status === 'en_direct') {
       actions = `<a class="btn live" href="#/salle/${id}">Rejoindre la salle</a>`;
+    } else if (w.status === 'termine') {
+      actions = `<button class="btn live" id="reopen-w">🔓 Rouvrir le direct</button>
+        <a class="btn" href="#/webinaires/${id}/reprogrammer">🗓️ Reprogrammer</a>`;
     } else if (w.status === 'annule') {
-      actions = '<button class="btn danger" id="delete-w">Supprimer</button>';
+      actions = `<button class="btn primary" id="restore-w">↩ Rétablir le webinaire</button>
+        <button class="btn danger" id="delete-w">Supprimer</button>`;
     }
   } else if (profile.role === 'apprenant') {
-    if (reg?.excluded) {
-      actions = '<span class="badge cancel">Vous avez été exclu de ce webinaire</span>';
-    } else if (w.status === 'en_direct' && reg) {
+    if (reg?.status === 'suspendu') {
+      actions = '<span class="badge cancel">Votre inscription est suspendue</span>';
+    } else if (w.status === 'en_direct' && reg?.status === 'approuve') {
       actions = `<a class="btn live" href="#/salle/${id}">Rejoindre le direct</a>`;
     } else if (open && reg) {
-      actions = '<span class="badge ok">✓ Inscrit</span><button class="btn sm" id="unreg">Se désinscrire</button>';
+      actions = `${regBadge(reg.status)}<button class="btn sm" id="unreg">Se désinscrire</button>`;
     } else if (open) {
       actions = '<button class="btn primary" id="reg">S’inscrire</button>';
     }
   }
+  const regNotice = reg?.status === 'en_attente' && open
+    ? `<div class="notice warn" style="margin-bottom:16px">⏳ Votre demande d’inscription est en attente de validation par l’encadreur.
+       Vous pourrez rejoindre le direct dès qu’elle sera approuvée.</div>` : '';
 
   view.innerHTML = `
     <div class="page-head">
@@ -879,6 +1069,7 @@ async function viewWebinarDetail(view, token, id) {
       w.cancel_reason ? ` : ${esc(w.cancel_reason)}` : '.'}</div>` : ''}
     ${w.rescheduled_at && w.status === 'planifie' ? `<div class="notice warn" style="margin-bottom:16px">
       Reprogrammé le ${esc(fmtShortDate(w.rescheduled_at))}. Nouvelle date ci-dessous.</div>` : ''}
+    ${regNotice}
     <div class="card">
       <div class="info-grid">
         <div><div class="k">Date</div><div class="v">${esc(fmtDate(w.starts_at))}</div></div>
@@ -888,13 +1079,29 @@ async function viewWebinarDetail(view, token, id) {
       </div>
       ${w.description ? `<p style="margin-top:16px;white-space:pre-line">${esc(w.description)}</p>` : ''}
     </div>
-    ${resources?.length ? `<div class="card"><h2>📚 Ressources du webinaire</h2>
-      <div class="list">${resources.map(r => resourceRow(r)).join('')}</div></div>` : ''}
+    ${resources.length || manage ? `<div class="card">
+      <div class="row spread" style="margin-bottom:8px">
+        <h2 style="margin:0">📚 Ressources du webinaire (${resources.length})</h2>
+        ${manage ? `<div class="row">
+          <button class="btn sm" id="link-res">＋ Depuis la bibliothèque</button>
+          <button class="btn primary sm" id="upload-res">⬆ Déposer un fichier</button></div>` : ''}
+      </div>
+      ${resources.length ? `<div class="list">${resources.map(r => resourceRow(r, manage)).join('')}</div>` :
+        '<p class="muted">Aucune ressource associée. Ajoutez des supports de cours pour les apprenants.</p>'}
+    </div>` : ''}
     ${manage ? '<div class="card" id="manage">' + loading() + '</div>' : ''}`;
 
   bindResourceButtons(view);
+  view.querySelectorAll('[data-unlink]').forEach(b => b.addEventListener('click', async () => {
+    const { error: err } = await sb.from('webinar_resources').delete().eq('webinar_id', id).eq('resource_id', b.dataset.unlink);
+    if (err) return fail(err);
+    toast('Ressource retirée du webinaire.');
+    route();
+  }));
 
   const on = (sel, fn) => { const el = view.querySelector(sel); if (el) el.addEventListener('click', fn); };
+  on('#link-res', () => linkResourcesDialog(w, resources.map(r => r.id)));
+  on('#upload-res', () => uploadDialog(() => route(), w.id));
   on('#reg', async () => { if (await register(id)) route(); });
   on('#unreg', async () => { if (await unregister(id)) route(); });
   on('#cancel-w', async () => {
@@ -908,6 +1115,13 @@ async function viewWebinarDetail(view, token, id) {
     toast('Webinaire annulé.');
     route();
   });
+  on('#reopen-w', () => reopenWebinar(w));
+  on('#restore-w', async () => {
+    const { error: err } = await sb.from('webinars').update({ status: 'planifie', cancel_reason: null }).eq('id', id);
+    if (err) return fail(err);
+    toast('Webinaire rétabli ✓ Pensez à vérifier sa date.', 'success');
+    route();
+  });
   on('#delete-w', async () => {
     if (!await confirmDialog('Supprimer définitivement ce webinaire ?', { confirmLabel: 'Supprimer', danger: true })) return;
     const { error: err } = await sb.from('webinars').delete().eq('id', id);
@@ -917,6 +1131,19 @@ async function viewWebinarDetail(view, token, id) {
   });
 
   if (manage) renderManagement(document.getElementById('manage'), w, token);
+}
+
+// Rouvrir un webinaire terminé : le direct reprend, la présence continue de s'enregistrer.
+async function reopenWebinar(w) {
+  if (!await confirmDialog('Rouvrir le direct ? Les apprenants approuvés pourront revenir dans la salle.', {
+    confirmLabel: 'Rouvrir le direct'
+  })) return false;
+  const { error } = await sb.from('webinars').update({ status: 'en_direct' }).eq('id', w.id);
+  if (error) { fail(error); return false; }
+  toast('Direct rouvert ✓', 'success');
+  if (location.hash === `#/salle/${w.id}`) onWebinarUpdate({ status: 'en_direct' });
+  else location.hash = `#/salle/${w.id}`;
+  return true;
 }
 
 // Inscrits et liste de présence (encadreur / admin).
@@ -933,10 +1160,15 @@ async function renderManagement(box, w, token, tab = 'inscrits') {
   const sessions = att.filter(a => a.user_id !== w.encadreur_id);
   const report = presenceReport(w, regs, sessions);
   const present = report.filter(r => r.sessions.length).length;
+  const waiting = regs.filter(r => r.status === 'en_attente');
+  // Les demandes en attente d'abord, puis les approuvées, puis les suspendues.
+  const order = { en_attente: 0, approuve: 1, suspendu: 2 };
+  regs.sort((a, b) => order[a.status] - order[b.status]);
 
   box.innerHTML = `
     <div class="tabs">
-      <button data-tab="inscrits" class="${tab === 'inscrits' ? 'active' : ''}">🎓 Inscrits (${regs.length})</button>
+      <button data-tab="inscrits" class="${tab === 'inscrits' ? 'active' : ''}">🎓 Inscriptions (${regs.length})${
+        waiting.length ? ` · ⏳ ${waiting.length}` : ''}</button>
       <button data-tab="presences" class="${tab === 'presences' ? 'active' : ''}">✅ Liste de présence (${present})</button>
     </div>
     <div id="tab-body"></div>`;
@@ -944,18 +1176,19 @@ async function renderManagement(box, w, token, tab = 'inscrits') {
   const body = box.querySelector('#tab-body');
   if (tab === 'inscrits') {
     body.innerHTML = regs.length ? `
+      ${waiting.length ? `<div class="notice warn row spread" style="margin-bottom:12px">
+        <span>⏳ ${waiting.length} demande${waiting.length > 1 ? 's' : ''} d’inscription à valider</span>
+        <button class="btn primary sm" id="approve-all">✓ Tout approuver</button></div>` : ''}
       <div class="table-wrap"><table>
-        <thead><tr><th>Apprenant</th><th>E-mail</th><th>Inscrit le</th><th>Statut</th><th></th></tr></thead>
+        <thead><tr><th>Apprenant</th><th>Demande le</th><th>Statut</th><th></th></tr></thead>
         <tbody>${regs.map(r => `<tr>
-          <td><div class="row"><div class="avatar sm">${esc(initials(r.apprenant?.full_name))}</div>${esc(r.apprenant?.full_name)}</div></td>
-          <td class="muted">${esc(r.apprenant?.email)}</td>
-          <td>${esc(fmtShortDate(r.registered_at))}</td>
-          <td>${r.excluded ? '<span class="badge cancel">Exclu</span>' : '<span class="badge ok">Inscrit</span>'}</td>
-          <td style="text-align:right">${r.excluded
-            ? `<button class="btn sm" data-readmit="${r.apprenant_id}">Réintégrer</button>`
-            : `<button class="btn danger sm" data-exclude="${r.apprenant_id}">Exclure</button>`}</td>
+          <td><div class="row" style="flex-wrap:nowrap"><div class="avatar sm">${esc(initials(r.apprenant?.full_name))}</div>
+            <div><div>${esc(r.apprenant?.full_name)}</div><div class="muted small">${esc(r.apprenant?.email)}</div></div></div></td>
+          <td>${esc(fmtShortDate(r.registered_at))} à ${esc(fmtTime(r.registered_at))}</td>
+          <td>${regBadge(r.status)}</td>
+          <td><div class="row" style="justify-content:flex-end">${regActions(r)}</div></td>
         </tr>`).join('')}</tbody>
-      </table></div>` : emptyState('🎓', 'Aucun apprenant inscrit pour le moment.');
+      </table></div>` : emptyState('🎓', 'Aucune demande d’inscription pour le moment.');
   } else {
     body.innerHTML = `
       <div class="row spread" style="margin-bottom:12px">
@@ -981,11 +1214,19 @@ async function renderManagement(box, w, token, tab = 'inscrits') {
 
   box.querySelectorAll('[data-tab]').forEach(b =>
     b.addEventListener('click', () => renderManagement(box, w, token, b.dataset.tab)));
-  box.querySelectorAll('[data-exclude], [data-readmit]').forEach(b => b.addEventListener('click', async () => {
-    const userId = b.dataset.exclude || b.dataset.readmit;
-    const ok = await setExcluded(w.id, userId, !!b.dataset.exclude);
+  box.querySelectorAll('[data-reg-status]').forEach(b => b.addEventListener('click', async () => {
+    const ok = await setRegistrationStatus(w.id, b.dataset.user, b.dataset.regStatus);
     if (ok) renderManagement(box, w, token, tab);
   }));
+  const all = box.querySelector('#approve-all');
+  if (all) all.addEventListener('click', async () => {
+    all.disabled = true;
+    const { error } = await sb.from('registrations').update({ status: 'approuve' })
+      .eq('webinar_id', w.id).eq('status', 'en_attente');
+    if (error) { all.disabled = false; return fail(error); }
+    toast(`${waiting.length} inscription${waiting.length > 1 ? 's' : ''} approuvée${waiting.length > 1 ? 's' : ''} ✓`, 'success');
+    renderManagement(box, w, token, tab);
+  });
   const exp = box.querySelector('#export');
   if (exp) exp.addEventListener('click', () => exportPresence(w, report));
 }
@@ -993,8 +1234,10 @@ async function renderManagement(box, w, token, tab = 'inscrits') {
 function presenceReport(w, regs, sessions) {
   const now = Date.now();
   const people = new Map();
-  regs.forEach(r => people.set(r.apprenant_id, {
-    name: r.apprenant?.full_name || '', email: r.apprenant?.email || '', excluded: r.excluded, sessions: [], total: 0
+  // Seuls les apprenants approuvés (ou venus au direct) figurent dans la liste de présence.
+  regs.filter(r => r.status !== 'en_attente').forEach(r => people.set(r.apprenant_id, {
+    name: r.apprenant?.full_name || '', email: r.apprenant?.email || '', excluded: r.status === 'suspendu',
+    sessions: [], total: 0
   }));
   sessions.forEach(a => {
     if (!people.has(a.user_id)) {
@@ -1026,14 +1269,24 @@ function exportPresence(w, report) {
   downloadCsv(`presence-${slug(w.title)}-${dateInput(new Date(w.starts_at))}.csv`, rows);
 }
 
-async function setExcluded(webinarId, userId, excluded) {
-  if (excluded && !await confirmDialog('Exclure cet apprenant du webinaire ?', {
-    confirmLabel: 'Exclure', danger: true
+function regActions(r) {
+  const btn = (status, label, cls) =>
+    `<button class="btn ${cls} sm" data-reg-status="${status}" data-user="${r.apprenant_id}">${label}</button>`;
+  if (r.status === 'en_attente') return btn('approuve', '✓ Approuver', 'primary') + btn('suspendu', 'Refuser', 'ghost');
+  if (r.status === 'suspendu') return btn('approuve', 'Réactiver', '');
+  return btn('suspendu', 'Suspendre', 'danger');
+}
+
+// Approuver, suspendre (exclure) ou réactiver l'inscription d'un apprenant.
+async function setRegistrationStatus(webinarId, userId, status) {
+  if (status === 'suspendu' && !await confirmDialog('Suspendre l’inscription de cet apprenant ?', {
+    confirmLabel: 'Suspendre', danger: true
   })) return false;
-  const { error } = await sb.from('registrations').update({ excluded })
-    .eq('webinar_id', webinarId).eq('apprenant_id', userId);
+  const { data, error } = await sb.from('registrations').update({ status })
+    .eq('webinar_id', webinarId).eq('apprenant_id', userId).select('status');
   if (error) { fail(error); return false; }
-  toast(excluded ? 'Apprenant exclu.' : 'Apprenant réintégré.', 'success');
+  if (!data.length) { toast("Vous n'avez pas le droit de modifier cette inscription.", 'error'); return false; }
+  toast(status === 'approuve' ? 'Inscription approuvée ✓' : 'Inscription suspendue.', 'success');
   return true;
 }
 
@@ -1044,8 +1297,48 @@ async function setExcluded(webinarId, userId, excluded) {
 function emptyRoom() {
   return {
     id: null, webinar: null, isHost: false, channel: null, sessionId: null, heartbeat: null,
-    tab: 'chat', messages: [], polls: [], votes: [], presence: {}
+    tab: 'chat', messages: [], polls: [], votes: [], presence: {},
+    joinedAt: null, hand: false, handAt: null, handsSeen: new Set(), pendingRegs: []
   };
+}
+
+// Ma présence dans la salle (nom, rôle, main levée), visible des autres en temps réel.
+function trackMe() {
+  if (!room.channel) return;
+  room.channel.track({
+    user_id: profile.id, name: profile.full_name, role: profile.role,
+    joined_at: room.joinedAt, hand: room.hand, hand_at: room.handAt
+  });
+}
+
+function setHand(raised) {
+  room.hand = raised;
+  room.handAt = raised ? new Date().toISOString() : null;
+  trackMe();
+  renderHandBar();
+}
+
+function renderHandBar() {
+  const bar = document.getElementById('hand-bar');
+  if (!bar) return;
+  bar.innerHTML = room.hand
+    ? `<div class="notice warn row spread"><span>✋ <strong>Vous avez levé la main.</strong> L’encadreur est prévenu et vous donnera la parole.</span>
+        <button class="btn sm" id="hand-toggle">Baisser la main</button></div>`
+    : '<button class="btn" id="hand-toggle">✋ Lever la main</button>';
+  bar.querySelector('#hand-toggle').addEventListener('click', () => setHand(!room.hand));
+}
+
+// Demandes d'inscription en attente, admissibles depuis la salle (encadreur).
+async function loadPendingRegs() {
+  if (!room.isHost) return;
+  const id = room.id;
+  const { data } = await sb.from('registrations')
+    .select('apprenant_id, registered_at, apprenant:profiles!apprenant_id(full_name, email)')
+    .eq('webinar_id', id).eq('status', 'en_attente').order('registered_at');
+  if (room.id !== id) return;
+  room.pendingRegs = data || [];
+  renderRoomMeta();
+  if (room.tab === 'participants') renderPanel();
 }
 
 let room = emptyRoom();
@@ -1067,17 +1360,20 @@ async function viewRoom(view, token, id) {
 
   const isHost = canManage(w);
   if (!isHost) {
-    const { data: reg } = await sb.from('registrations').select('excluded')
+    const { data: reg } = await sb.from('registrations').select('status')
       .eq('webinar_id', id).eq('apprenant_id', profile.id).maybeSingle();
     if (isStale(token)) return;
-    if (!reg || reg.excluded) {
-      view.innerHTML = `<div class="card">${emptyState('🔒', reg ? 'Vous avez été exclu de ce webinaire.' :
-        'Inscrivez-vous à ce webinaire pour accéder à la salle.', `<a class="btn primary" href="#/webinaires/${id}">Voir le webinaire</a>`)}</div>`;
+    if (reg?.status !== 'approuve') {
+      const message = !reg ? 'Inscrivez-vous à ce webinaire pour accéder à la salle.'
+        : reg.status === 'en_attente' ? 'Votre inscription attend la validation de l’encadreur.'
+        : 'Votre inscription à ce webinaire est suspendue.';
+      view.innerHTML = `<div class="card">${emptyState('🔒', message,
+        `<a class="btn primary" href="#/webinaires/${id}">Voir le webinaire</a>`)}</div>`;
       return;
     }
   }
 
-  room = { ...emptyRoom(), id, webinar: w, isHost };
+  room = { ...emptyRoom(), id, webinar: w, isHost, joinedAt: new Date().toISOString() };
 
   const [msgs, polls] = await Promise.all([
     sb.from('messages').select('*').eq('webinar_id', id).order('created_at').limit(500),
@@ -1096,8 +1392,20 @@ async function viewRoom(view, token, id) {
   channel
     .on('presence', { event: 'sync' }, () => {
       room.presence = channel.presenceState();
+      // L'encadreur est prévenu de chaque nouvelle main levée.
+      const hands = onlineList().filter(p => p.hand);
+      if (room.isHost) {
+        hands.filter(p => !room.handsSeen.has(p.user_id)).forEach(p => toast(`✋ ${p.name} lève la main`));
+      }
+      room.handsSeen = new Set(hands.map(p => p.user_id));
       renderRoomMeta();
       if (room.tab === 'participants') renderPanel();
+    })
+    .on('broadcast', { event: 'lower-hand' }, ({ payload }) => {
+      if (payload.user_id === profile.id && room.hand) {
+        setHand(false);
+        toast('L’encadreur a baissé votre main.');
+      }
     })
     .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `webinar_id=eq.${id}` }, p => {
       if (!room.messages.some(m => m.id === p.new.id)) room.messages.push(p.new);
@@ -1121,14 +1429,18 @@ async function viewRoom(view, token, id) {
     })
     .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'registrations',
       filter: `apprenant_id=eq.${profile.id}` }, p => {
-      if (p.new.webinar_id === id && p.new.excluded) kickOut("L'encadreur vous a retiré de ce webinaire.");
-    })
-    .subscribe(status => {
-      if (status === 'SUBSCRIBED') {
-        channel.track({ user_id: profile.id, name: profile.full_name, role: profile.role, joined_at: new Date().toISOString() });
-      }
+      if (p.new.webinar_id === id && p.new.status !== 'approuve') kickOut("L'encadreur a suspendu votre inscription à ce webinaire.");
     });
+  if (isHost) {
+    // Nouvelles demandes d'inscription pendant le direct.
+    channel.on('postgres_changes', { event: '*', schema: 'public', table: 'registrations',
+      filter: `webinar_id=eq.${id}` }, () => loadPendingRegs());
+  }
+  channel.subscribe(status => {
+    if (status === 'SUBSCRIBED') trackMe();
+  });
 
+  await loadPendingRegs();
   if (w.status === 'en_direct' && !isHost) await startAttendance();
   if (isStale(token) || room.id !== id) return;
   renderRoomView();
@@ -1198,11 +1510,17 @@ function onlineList() {
     .sort((a, b) => (a.name || '').localeCompare(b.name || '', 'fr'));
 }
 
+function participantsLabel() {
+  const hands = onlineList().filter(p => p.hand).length;
+  return `👥 ${onlineList().length}${hands ? ` · ✋ ${hands}` : ''}${room.pendingRegs.length ? ` · ⏳ ${room.pendingRegs.length}` : ''}`;
+}
+
 function renderRoomMeta() {
+  const hands = onlineList().filter(p => p.hand).length;
   const el = document.getElementById('online-count');
-  if (el) el.textContent = `👥 ${onlineList().length} en ligne`;
+  if (el) el.textContent = `👥 ${onlineList().length} en ligne${hands ? ` · ✋ ${hands} main${hands > 1 ? 's' : ''} levée${hands > 1 ? 's' : ''}` : ''}`;
   const tabBtn = document.querySelector('[data-rtab="participants"]');
-  if (tabBtn) tabBtn.textContent = `👥 ${onlineList().length}`;
+  if (tabBtn) tabBtn.textContent = participantsLabel();
 }
 
 function renderRoomView() {
@@ -1232,7 +1550,7 @@ function renderRoomView() {
   }
 
   const tabs = [['chat', '💬 Chat'], ['questions', '❓ Questions'], ['sondages', '📊 Sondages']];
-  if (host) tabs.push(['participants', `👥 ${onlineList().length}`]);
+  if (host) tabs.push(['participants', participantsLabel()]);
 
   view.innerHTML = `
     <div class="page-head">
@@ -1246,6 +1564,7 @@ function renderRoomView() {
       <section>
         <div class="stage">${stage}</div>
         ${host ? stageToolbar(w) : ''}
+        ${!host && w.status === 'en_direct' ? '<div class="stage-tools" id="hand-bar"></div>' : ''}
       </section>
       <aside class="card side-panel">
         <div class="tabs">${tabs.map(([k, l]) =>
@@ -1261,6 +1580,7 @@ function renderRoomView() {
     renderPanel();
   }));
   if (host) bindStageToolbar(w);
+  renderHandBar();
   renderPanel();
 }
 
@@ -1268,6 +1588,9 @@ function stageToolbar(w) {
   if (w.status === 'planifie') {
     return `<div class="stage-tools"><button class="btn live" id="go-live">🎬 Démarrer le direct</button>
       <span class="muted small" style="align-self:center">Les apprenants inscrits pourront entrer dès le démarrage.</span></div>`;
+  }
+  if (w.status === 'termine') {
+    return '<div class="stage-tools"><button class="btn live" id="reopen-live">🔓 Rouvrir le direct</button></div>';
   }
   if (w.status !== 'en_direct') return '';
   return `
@@ -1296,6 +1619,7 @@ function bindStageToolbar(w) {
   const view = document.getElementById('view');
   const on = (sel, fn) => { const el = view.querySelector(sel); if (el) el.addEventListener('click', fn); };
 
+  on('#reopen-live', () => reopenWebinar(w));
   on('#go-live', async () => {
     const { error } = await sb.from('webinars').update({ status: 'en_direct' }).eq('id', w.id);
     if (error) return fail(error);
@@ -1337,16 +1661,45 @@ function renderPanel() {
   const canPost = w.status === 'en_direct' || (room.isHost && w.status === 'planifie');
 
   if (room.tab === 'participants') {
-    const people = onlineList();
-    panel.innerHTML = people.length ? `<div class="list">${people.map(p => `
-      <div class="list-item">
-        <div class="avatar sm">${esc(initials(p.name))}</div>
-        <div class="grow"><div>${esc(p.name)}</div>
-          <div class="muted small">${ROLE_LABELS[p.role] || ''} · depuis ${esc(fmtTime(p.joined_at))}</div></div>
-        ${p.role === 'apprenant' ? `<button class="btn danger sm" data-kick="${p.user_id}">Exclure</button>` : ''}
-      </div>`).join('')}</div>` : emptyState('👥', 'Personne en ligne pour le moment.');
+    // Mains levées d'abord (dans l'ordre où elles ont été levées), puis les autres.
+    const people = onlineList().sort((a, b) =>
+      (b.hand ? 1 : 0) - (a.hand ? 1 : 0) || (a.hand_at || '').localeCompare(b.hand_at || ''));
+    const hands = people.filter(p => p.hand).length;
+    panel.innerHTML = `<div class="messages">
+      ${room.pendingRegs.length ? `
+        <div class="notice warn"><strong>⏳ En attente d’admission (${room.pendingRegs.length})</strong>
+          <div class="list">${room.pendingRegs.map(r => `
+            <div class="list-item">
+              <div class="avatar sm">${esc(initials(r.apprenant?.full_name))}</div>
+              <div class="grow" style="color:var(--text)">${esc(r.apprenant?.full_name)}</div>
+              <button class="btn primary sm" data-admit="${r.apprenant_id}">Admettre</button>
+              <button class="btn ghost sm" data-refuse="${r.apprenant_id}">Refuser</button>
+            </div>`).join('')}</div></div>` : ''}
+      <div class="muted small">En ligne : ${people.length}${hands ? ` · ✋ ${hands} main${hands > 1 ? 's' : ''} levée${hands > 1 ? 's' : ''}` : ''}</div>
+      ${people.length ? `<div class="list">${people.map(p => `
+        <div class="list-item">
+          <div class="avatar sm">${esc(initials(p.name))}</div>
+          <div class="grow"><div>${p.hand ? '✋ ' : ''}${esc(p.name)}</div>
+            <div class="muted small">${ROLE_LABELS[p.role] || ''} · ${p.hand
+              ? `main levée à ${esc(fmtTime(p.hand_at))}` : `depuis ${esc(fmtTime(p.joined_at))}`}</div></div>
+          ${p.hand ? `<button class="btn sm" data-lower="${p.user_id}" title="Baisser la main">👇</button>` : ''}
+          ${p.role === 'apprenant' ? `<button class="btn danger sm" data-kick="${p.user_id}">Exclure</button>` : ''}
+        </div>`).join('')}</div>` : emptyState('👥', 'Personne en ligne pour le moment.')}
+    </div>`;
     panel.querySelectorAll('[data-kick]').forEach(b => b.addEventListener('click', () =>
-      setExcluded(w.id, b.dataset.kick, true)));
+      setRegistrationStatus(w.id, b.dataset.kick, 'suspendu')));
+    panel.querySelectorAll('[data-lower]').forEach(b => b.addEventListener('click', () =>
+      room.channel.send({ type: 'broadcast', event: 'lower-hand', payload: { user_id: b.dataset.lower } })));
+    panel.querySelectorAll('[data-admit], [data-refuse]').forEach(b => b.addEventListener('click', async () => {
+      const status = b.dataset.admit ? 'approuve' : 'suspendu';
+      const userId = b.dataset.admit || b.dataset.refuse;
+      b.disabled = true;
+      const { error } = await sb.from('registrations').update({ status })
+        .eq('webinar_id', w.id).eq('apprenant_id', userId);
+      if (error) { b.disabled = false; return fail(error); }
+      toast(status === 'approuve' ? 'Apprenant admis ✓ Il peut entrer dans la salle.' : 'Demande refusée.', 'success');
+      loadPendingRegs();
+    }));
     return;
   }
 
@@ -1685,7 +2038,7 @@ function fileType(r) {
   return 'autre';
 }
 
-function resourceRow(r) {
+function resourceRow(r, removable = false) {
   const t = fileType(r);
   return `<div class="list-item">
     <div class="ftype ${t}">${FILE_TYPES[t][0]}</div>
@@ -1693,7 +2046,98 @@ function resourceRow(r) {
       <div class="muted small">${FILE_TYPES[t][1]} · ${esc(fmtSize(r.size_bytes))}</div></div>
     <button class="btn sm" data-open="${r.id}" data-path="${esc(r.file_path)}" data-name="${esc(r.file_name)}"
       data-type="${t}">${t === 'video' ? '▶ Regarder' : 'Ouvrir'}</button>
+    ${removable ? `<button class="btn ghost sm" data-unlink="${r.id}" title="Retirer du webinaire">Retirer</button>` : ''}
   </div>`;
+}
+
+// Webinaires que l'utilisateur peut gérer (les siens, ou tous pour l'admin).
+async function manageableWebinars() {
+  let query = sb.from('webinars').select('id, title, starts_at, status').neq('status', 'annule')
+    .order('starts_at', { ascending: false });
+  if (profile.role !== 'admin') query = query.eq('encadreur_id', profile.id);
+  const { data, error } = await query;
+  if (error) throw error;
+  return data;
+}
+
+// Depuis la bibliothèque : choisir les webinaires auxquels associer une ressource.
+async function linkWebinarsDialog(r, onDone) {
+  let webinars;
+  try { webinars = await manageableWebinars(); } catch (err) { return fail(err); }
+  const linked = new Set((r.links || []).map(l => l.webinar?.id));
+  openModal(`
+    <h2>🔗 Associer « ${esc(r.title)} »</h2>
+    <p class="muted">Cochez les webinaires dans lesquels cette ressource doit apparaître.</p>
+    ${webinars.length ? `<div class="list" style="max-height:360px;overflow-y:auto">${webinars.map(w => `
+      <label class="list-item" style="font-weight:400;cursor:pointer">
+        <input type="checkbox" value="${w.id}" ${linked.has(w.id) ? 'checked' : ''} style="width:auto;margin:0">
+        <div class="grow"><strong>${esc(w.title)}</strong>
+          <div class="muted small">${esc(fmtShortDate(w.starts_at))} · ${esc(STATUS_LABELS[w.status])}</div></div>
+      </label>`).join('')}</div>` : emptyState('🎥', 'Vous n’avez encore aucun webinaire.')}
+    <div class="actions">
+      <button class="btn" data-close>Annuler</button>
+      ${webinars.length ? '<button class="btn primary" id="save-links">Enregistrer</button>' : ''}
+    </div>`);
+  const save = modal.querySelector('#save-links');
+  if (!save) return;
+  save.addEventListener('click', async () => {
+    const checked = new Set([...modal.querySelectorAll('input[type=checkbox]:checked')].map(c => c.value));
+    const toAdd = webinars.filter(w => checked.has(w.id) && !linked.has(w.id));
+    const toRemove = webinars.filter(w => !checked.has(w.id) && linked.has(w.id));
+    save.disabled = true;
+    if (toAdd.length) {
+      const { error } = await sb.from('webinar_resources').insert(toAdd.map(w => ({ webinar_id: w.id, resource_id: r.id })));
+      if (error) { save.disabled = false; return fail(error); }
+    }
+    for (const w of toRemove) {
+      const { error } = await sb.from('webinar_resources').delete().eq('webinar_id', w.id).eq('resource_id', r.id);
+      if (error) { save.disabled = false; return fail(error); }
+    }
+    // Les liens vers des webinaires d'autres encadreurs ne sont pas modifiés.
+    const kept = (r.links || []).filter(l => !webinars.some(w => w.id === l.webinar?.id));
+    r.links = [...kept, ...webinars.filter(w => checked.has(w.id)).map(w => ({ webinar: { id: w.id, title: w.title } }))];
+    closeModal();
+    toast('Associations enregistrées ✓', 'success');
+    onDone();
+  });
+}
+
+// Depuis un webinaire : associer des ressources déjà présentes dans la bibliothèque.
+async function linkResourcesDialog(w, linkedIds) {
+  const { data: resources, error } = await sb.from('resources').select('*').order('created_at', { ascending: false });
+  if (error) return fail(error);
+  const linked = new Set(linkedIds);
+  let changed = false;
+  openModal(`
+    <h2>📚 Ajouter des ressources au webinaire</h2>
+    <input type="search" id="res-search" placeholder="Rechercher dans la bibliothèque…" style="margin:0">
+    <div class="list" id="res-list" style="max-height:380px;overflow-y:auto"></div>
+    <div class="actions"><button class="btn primary" data-close>Terminé</button></div>`);
+  onModalClose = () => { if (changed) route(); };
+
+  const draw = (search = '') => {
+    const list = resources.filter(r => !search || `${r.title} ${r.file_name}`.toLowerCase().includes(search));
+    modal.querySelector('#res-list').innerHTML = list.length ? list.map(r => {
+      const t = fileType(r);
+      return `<div class="list-item">
+        <div class="ftype ${t}">${FILE_TYPES[t][0]}</div>
+        <div class="grow"><strong>${esc(r.title)}</strong><div class="muted small">${FILE_TYPES[t][1]} · ${esc(fmtSize(r.size_bytes))}</div></div>
+        ${linked.has(r.id) ? '<span class="badge ok">✓ Associée</span>' :
+          `<button class="btn primary sm" data-attach="${r.id}">Associer</button>`}
+      </div>`;
+    }).join('') : emptyState('📚', resources.length ? 'Aucune ressource ne correspond.' :
+      'La bibliothèque est vide. Utilisez « Déposer un fichier ».');
+    modal.querySelectorAll('[data-attach]').forEach(b => b.addEventListener('click', async () => {
+      b.disabled = true;
+      const { error: err } = await sb.from('webinar_resources').insert({ webinar_id: w.id, resource_id: b.dataset.attach });
+      if (err) { b.disabled = false; return fail(err); }
+      linked.add(b.dataset.attach);
+      changed = true;
+      draw(modal.querySelector('#res-search').value.trim().toLowerCase());
+    }));
+  };
+  draw();
+  modal.querySelector('#res-search').addEventListener('input', e => draw(e.target.value.trim().toLowerCase()));
 }
 
 function bindResourceButtons(container) {
@@ -1721,9 +2165,11 @@ async function openResource(r, type) {
   }
 }
 
+const RESOURCE_SELECT = '*, owner:profiles!owner_id(full_name), links:webinar_resources(webinar:webinars(id, title))';
+
 async function viewLibrary(view, token) {
   const { data: resources, error } = await sb.from('resources')
-    .select('*, owner:profiles!owner_id(full_name), webinar:webinars(id, title)')
+    .select(RESOURCE_SELECT)
     .order('created_at', { ascending: false });
   if (isStale(token)) return;
   if (error) return (view.innerHTML = `<div class="notice danger">${esc(translateError(error))}</div>`);
@@ -1756,6 +2202,7 @@ async function viewLibrary(view, token) {
     results.innerHTML = list.length ? `<div class="grid">${list.map(r => {
       const t = fileType(r);
       const mine = r.owner_id === profile.id || profile.role === 'admin';
+      const links = (r.links || []).filter(l => l.webinar);
       return `<article class="card rcard">
         <div class="row" style="flex-wrap:nowrap">
           <div class="ftype ${t}">${FILE_TYPES[t][0]}</div>
@@ -1763,16 +2210,21 @@ async function viewLibrary(view, token) {
             <div class="muted small">${FILE_TYPES[t][1]} · ${esc(fmtSize(r.size_bytes))} · ${esc(fmtShortDate(r.created_at))}</div></div>
         </div>
         ${r.description ? `<p class="muted small clamp">${esc(r.description)}</p>` : ''}
-        <div class="muted small">🧑‍🏫 ${esc(r.owner?.full_name)}${r.webinar ? ` · 🎥 <a href="#/webinaires/${r.webinar.id}">${esc(r.webinar.title)}</a>` : ''}</div>
+        <div class="muted small">🧑‍🏫 ${esc(r.owner?.full_name)}</div>
+        ${links.length ? `<div class="row">${links.map(l =>
+          `<a class="badge" href="#/webinaires/${l.webinar.id}">🎥 ${esc(l.webinar.title)}</a>`).join('')}</div>` : ''}
         <div class="row" style="margin-top:auto">
           <button class="btn primary sm" data-open="${r.id}" data-path="${esc(r.file_path)}" data-name="${esc(r.file_name)}"
             data-type="${t}">${t === 'video' ? '▶ Regarder' : t === 'pdf' || t === 'image' ? 'Ouvrir' : '⬇ Télécharger'}</button>
+          ${isStaff() ? `<button class="btn sm" data-link="${r.id}">🔗 Lier à un webinaire</button>` : ''}
           ${mine ? `<button class="btn ghost sm" data-delete="${r.id}">Supprimer</button>` : ''}
         </div>
       </article>`;
     }).join('')}</div>` : `<div class="card">${emptyState('📚', resources.length ?
       'Aucune ressource ne correspond.' : 'La bibliothèque est vide pour le moment.')}</div>`;
     bindResourceButtons(results);
+    results.querySelectorAll('[data-link]').forEach(b => b.addEventListener('click', () =>
+      linkWebinarsDialog(resources.find(x => x.id === b.dataset.link), draw)));
     results.querySelectorAll('[data-delete]').forEach(b => b.addEventListener('click', async () => {
       const r = resources.find(x => x.id === b.dataset.delete);
       if (!await confirmDialog(`Supprimer « ${r.title} » ?`, { confirmLabel: 'Supprimer', danger: true })) return;
@@ -1799,10 +2251,9 @@ async function viewLibrary(view, token) {
   if (up) up.addEventListener('click', () => uploadDialog(created => { resources.unshift(created); draw(); }));
 }
 
-async function uploadDialog(onDone) {
-  let query = sb.from('webinars').select('id, title, starts_at').neq('status', 'annule').order('starts_at', { ascending: false });
-  if (profile.role === 'encadreur') query = query.eq('encadreur_id', profile.id);
-  const { data: webinars } = await query;
+async function uploadDialog(onDone, presetWebinarId = '') {
+  let webinars = [];
+  try { webinars = await manageableWebinars(); } catch (err) { console.error(err); }
 
   openModal(`
     <h2>Déposer une ressource</h2>
@@ -1818,7 +2269,8 @@ async function uploadDialog(onDone) {
       <label>Description<textarea name="description" rows="2" maxlength="1000"></textarea></label>
       <label>Webinaire associé (facultatif)
         <select name="webinar_id"><option value="">— Aucun —</option>
-          ${(webinars || []).map(w => `<option value="${w.id}">${esc(w.title)} (${esc(fmtShortDate(w.starts_at))})</option>`).join('')}
+          ${webinars.map(w => `<option value="${w.id}" ${w.id === presetWebinarId ? 'selected' : ''}>${
+            esc(w.title)} (${esc(fmtShortDate(w.starts_at))})</option>`).join('')}
         </select></label>
       <div class="actions">
         <button class="btn" type="button" data-close>Annuler</button>
@@ -1861,14 +2313,19 @@ async function uploadDialog(onDone) {
       file_path: path,
       file_name: file.name,
       mime_type: file.type || '',
-      size_bytes: file.size,
-      webinar_id: form.webinar_id.value || null
-    }).select('*, owner:profiles!owner_id(full_name), webinar:webinars(id, title)').single();
+      size_bytes: file.size
+    }).select(RESOURCE_SELECT).single();
     if (e2) {
       await sb.storage.from('bibliotheque').remove([path]);
       btn.disabled = false;
       btn.textContent = 'Déposer';
       return fail(e2);
+    }
+    const webinarId = form.webinar_id.value;
+    if (webinarId) {
+      const { error: e3 } = await sb.from('webinar_resources').insert({ webinar_id: webinarId, resource_id: data.id });
+      if (e3) fail(e3);
+      else data.links = [{ webinar: { id: webinarId, title: webinars.find(w => w.id === webinarId)?.title || '' } }];
     }
     closeModal();
     toast('Ressource déposée ✓', 'success');
@@ -2043,7 +2500,7 @@ async function showUserProfile(u, onChange) {
   openModal(loading(), { wide: true });
   const [sess, regs, att, owned] = await Promise.all([
     sb.from('app_sessions').select('*').eq('user_id', u.id).order('started_at', { ascending: false }).limit(300),
-    sb.from('registrations').select('registered_at, excluded, webinar:webinars(id, title, starts_at, status)').eq('apprenant_id', u.id),
+    sb.from('registrations').select('registered_at, status, webinar:webinars(id, title, starts_at, status)').eq('apprenant_id', u.id),
     sb.from('attendance').select('webinar_id, joined_at, last_seen_at, left_at').eq('user_id', u.id),
     sb.from('webinars').select('id, title, starts_at, status').eq('encadreur_id', u.id).order('starts_at', { ascending: false })
   ]);
@@ -2102,7 +2559,7 @@ async function showUserProfile(u, onChange) {
           <tbody>${regRows.map(r => `<tr>
             <td><a href="#/webinaires/${r.webinar.id}" data-close>${esc(r.webinar.title)}</a></td>
             <td>${esc(fmtShortDate(r.webinar.starts_at))}</td>
-            <td>${r.excluded ? '<span class="badge cancel">Exclu</span>' : '<span class="badge ok">Inscrit</span>'}</td>
+            <td>${regBadge(r.status)}</td>
             <td>${presence.has(r.webinar.id) ? esc(fmtDuration(presence.get(r.webinar.id))) :
               r.webinar.status === 'termine' ? '<span class="badge cancel">Absent</span>' : '—'}</td>
           </tr>`).join('')}</tbody></table>` : emptyState('🎥', 'Aucune inscription.'))
@@ -2176,7 +2633,12 @@ function viewProfile(view) {
         <label>Confirmer<input name="confirm" type="password" minlength="8" required autocomplete="new-password"></label>
         <div class="actions"><button class="btn primary" type="submit">Changer le mot de passe</button></div>
       </form>
-    </div>`;
+    </div>
+    ${profile.role === 'apprenant' ? `<div class="card row spread" style="margin-top:16px">
+      <div><h2 style="margin:0 0 4px">📝 Mes inscriptions aux webinaires</h2>
+        <p class="muted">Suivez vos demandes (en attente, approuvées, suspendues) et inscrivez-vous à de nouveaux webinaires.</p></div>
+      <a class="btn primary" href="#/mes-inscriptions">Gérer mes inscriptions</a>
+    </div>` : ''}`;
 
   view.querySelector('#name-form').addEventListener('submit', async e => {
     e.preventDefault();
