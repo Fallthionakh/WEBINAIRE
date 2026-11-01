@@ -44,10 +44,14 @@ Deno.serve(async req => {
     if (!webinar_id) return json({ error: 'Webinaire manquant.' }, 400);
 
     // Client Supabase au nom de la personne connectée : les règles RLS s'appliquent.
+    const authHeader = req.headers.get('Authorization') ?? '';
+    const jwt = authHeader.replace(/^Bearer\s+/i, '');
     const sb = createClient(Deno.env.get('SUPABASE_URL')!, publicKey(), {
-      global: { headers: { Authorization: req.headers.get('Authorization') ?? '' } }
+      global: { headers: { Authorization: authHeader } },
+      auth: { persistSession: false, autoRefreshToken: false }
     });
-    const { data: { user } } = await sb.auth.getUser();
+    // Sur le serveur il n'y a pas de session enregistrée : on vérifie le jeton reçu.
+    const { data: { user } } = await sb.auth.getUser(jwt);
     if (!user) return json({ error: 'Non connecté.' }, 401);
 
     const [canJoin, isOwner, webinar, profile] = await Promise.all([
