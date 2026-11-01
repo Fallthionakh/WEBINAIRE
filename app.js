@@ -1298,8 +1298,105 @@ function emptyRoom() {
   return {
     id: null, webinar: null, isHost: false, channel: null, sessionId: null, heartbeat: null,
     tab: 'chat', messages: [], polls: [], votes: [], presence: {},
-    joinedAt: null, hand: false, handAt: null, handsSeen: new Set(), pendingRegs: []
+    joinedAt: null, hand: false, handAt: null, handsSeen: new Set(), pendingRegs: [],
+    video: null, call: null, videoError: ''
   };
+}
+
+// =====================================================================
+// Visio Daily : caméra, micro et partage d'écran pour tous les participants
+// =====================================================================
+
+const DAILY_JS_URL = 'https://unpkg.com/@daily-co/daily-js@0.93.0/dist/daily.js';
+let dailyPromise = null;
+
+function loadDaily() {
+  if (!dailyPromise) {
+    dailyPromise = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = DAILY_JS_URL;
+      script.crossOrigin = 'anonymous';
+      script.onload = () => resolve(window.Daily);
+      script.onerror = () => { dailyPromise = null; reject(new Error('Daily indisponible')); };
+      document.head.append(script);
+    });
+  }
+  return dailyPromise;
+}
+
+// Demande un jeton à la fonction serveur « daily-token », puis rejoint la visio.
+// Si la visio n'est pas configurée, la salle revient au mode local (caméra de l'encadreur).
+async function startVideo() {
+  if (room.call || room.video === 'pending' || room.webinar?.status !== 'en_direct') return;
+  const id = room.id;
+  room.video = 'pending';
+  let auth;
+  try {
+    const { data, error } = await sb.functions.invoke('daily-token', { body: { webinar_id: id } });
+    if (error) {
+      let detail = error.message;
+      try { detail = (await error.context.json()).error || detail; } catch (e) { /* réponse non JSON */ }
+      throw new Error(detail);
+    }
+    auth = data;
+    await loadDaily();
+  } catch (err) {
+    if (room.id !== id) return;
+    console.warn('Visio indisponible :', err);
+    room.video = 'off';
+    room.videoError = err.message || String(err);
+    renderRoomView();
+    return;
+  }
+  const box = document.getElementById('video-stage');
+  if (room.id !== id || !box) { room.video = null; return; }
+  box.innerHTML = '';
+  room.call = window.Daily.createFrame(box, {
+    iframeStyle: { width: '100%', height: '100%', border: '0' },
+    showLeaveButton: false,
+    showFullscreenButton: true,
+    lang: 'fr'
+  });
+  room.video = 'on';
+  room.call.on('error', e => toast(`Visio : ${e?.errorMsg || 'erreur'}`, 'error'));
+  try {
+    await room.call.join({ url: auth.url, token: auth.token });
+  } catch (err) {
+    fail(err);
+  }
+}
+
+function stopVideo() {
+  if (room.call) {
+    try { room.call.destroy(); } catch (e) { /* déjà détruite */ }
+  }
+  room.call = null;
+  if (room.video !== 'off') room.video = null;
+}
+
+// Ouvrir un support (PDF, PowerPoint…) dans un onglet, à montrer avec « Partager l'écran ».
+async function pickSupport() {
+  const [{ data: links }, { data: all, error }] = await Promise.all([
+    sb.from('webinar_resources').select('resource_id').eq('webinar_id', room.id),
+    sb.from('resources').select('*').order('created_at', { ascending: false })
+  ]);
+  if (error) return fail(error);
+  const linked = new Set((links || []).map(l => l.resource_id));
+  const list = [...all].sort((a, b) => (linked.has(b.id) ? 1 : 0) - (linked.has(a.id) ? 1 : 0));
+  openModal(`
+    <h2>📚 Ouvrir un support à partager</h2>
+    <p class="muted">Le support s’ouvre dans un nouvel onglet. Dans la visio, cliquez ensuite sur
+      <strong>Partager l’écran</strong> et choisissez cet onglet.</p>
+    ${list.length ? `<div class="list" style="max-height:360px;overflow-y:auto">${list.map(r => {
+      const t = fileType(r);
+      return `<div class="list-item"><div class="ftype ${t}">${FILE_TYPES[t][0]}</div>
+        <div class="grow"><strong>${esc(r.title)}</strong>
+          <div class="muted small">${FILE_TYPES[t][1]}${linked.has(r.id) ? ' · lié à ce webinaire' : ''}</div></div>
+        <button class="btn primary sm" data-open="${r.id}" data-path="${esc(r.file_path)}" data-name="${esc(r.file_name)}"
+          data-type="${t}">Ouvrir</button></div>`;
+    }).join('')}</div>` : emptyState('📚', 'La bibliothèque est vide.')}
+    <div class="actions"><button class="btn" data-close>Fermer</button></div>`);
+  bindResourceButtons(modal);
 }
 
 // Ma présence dans la salle (nom, rôle, main levée), visible des autres en temps réel.
@@ -1444,6 +1541,7 @@ async function viewRoom(view, token, id) {
   if (w.status === 'en_direct' && !isHost) await startAttendance();
   if (isStale(token) || room.id !== id) return;
   renderRoomView();
+  startVideo();
 }
 
 async function startAttendance() {
@@ -1472,6 +1570,7 @@ function stopAttendance() {
 async function leaveRoom() {
   if (!room.id) return;
   stopAttendance();
+  stopVideo();
   if (room.channel) await sb.removeChannel(room.channel);
   stopMedia();
   room = emptyRoom();
@@ -1496,9 +1595,11 @@ function onWebinarUpdate(next) {
     if (next.status === 'en_direct') startAttendance();
     if (next.status === 'termine' || next.status === 'annule') {
       stopAttendance();
+      stopVideo();
       stopMedia();
     }
     renderRoomView();
+    if (next.status === 'en_direct') startVideo();
   } else if (!room.isHost) {
     const info = document.getElementById('stage-info');
     if (info) info.innerHTML = stageInfo(room.webinar);
@@ -1529,14 +1630,25 @@ function renderRoomView() {
   if (!view || !w) return;
   const host = room.isHost;
 
+  // Visio en cours : on ne reconstruit pas la page, sinon la visio serait coupée.
+  if (room.call && w.status === 'en_direct' && document.getElementById('video-stage')) {
+    renderRoomMeta();
+    renderHandBar();
+    renderPanel();
+    return;
+  }
+
+  const videoMode = w.status === 'en_direct' && room.video !== 'off';
   let stage;
-  if (w.status === 'en_direct' && host) {
+  if (videoMode) {
+    stage = `<div id="video-stage" class="video-stage">${loading('Connexion à la visio…')}</div>`;
+  } else if (w.status === 'en_direct' && host) {
     stage = '<div id="stage-host" class="stage-host"></div>';
   } else if (w.status === 'en_direct') {
     stage = `<div class="stage-msg"><span class="badge live">En direct</span>
       <h2 style="margin:0">${esc(w.encadreur?.full_name)} présente</h2>
       <div id="stage-info">${stageInfo(w)}</div>
-      <p class="small" style="opacity:.7">La transmission vidéo vers les participants arrivera avec le serveur WebRTC.<br>
+      <p class="small" style="opacity:.7">La visio n’est pas disponible pour le moment.<br>
       Votre présence est enregistrée automatiquement.</p></div>`;
   } else if (w.status === 'termine') {
     stage = '<div class="stage-msg"><h2 style="margin:0">Ce webinaire est terminé</h2><p style="opacity:.7">Merci pour votre participation.</p></div>';
@@ -1562,7 +1674,7 @@ function renderRoomView() {
     </div>
     <div class="room">
       <section>
-        <div class="stage">${stage}</div>
+        <div class="stage${videoMode ? ' video' : ''}">${stage}</div>
         ${host ? stageToolbar(w) : ''}
         ${!host && w.status === 'en_direct' ? '<div class="stage-tools" id="hand-bar"></div>' : ''}
       </section>
@@ -1593,7 +1705,19 @@ function stageToolbar(w) {
     return '<div class="stage-tools"><button class="btn live" id="reopen-live">🔓 Rouvrir le direct</button></div>';
   }
   if (w.status !== 'en_direct') return '';
+  if (room.video !== 'off') {
+    return `
+      <div class="stage-tools">
+        <button class="btn" id="support-open">📚 Ouvrir un support à partager</button>
+        <button class="btn" id="fullscreen">⛶ Plein écran</button>
+        <button class="btn danger" id="end-live">Terminer le direct</button>
+      </div>
+      <p class="hint" style="margin-top:8px">Dans la visio : caméra, micro, <strong>Partager l’écran</strong>,
+        et dans la liste <strong>People</strong> / <strong>Participants</strong>, couper le micro ou retirer un participant.</p>`;
+  }
   return `
+    ${room.videoError ? `<div class="notice warn" style="margin-top:12px">Visio indisponible (${esc(room.videoError)}).
+      Mode local : seule votre caméra s’affiche, elle n’est pas transmise aux apprenants.</div>` : ''}
     <div class="stage-tools">
       <button class="btn ${stageMode === 'camera' ? 'active' : ''}" data-mode="camera">📷 Caméra</button>
       ${canShareScreen() ? `<button class="btn ${stageMode === 'screen' ? 'active' : ''}" data-mode="screen">🖥️ Partager l'écran</button>` : ''}
@@ -1643,12 +1767,13 @@ function bindStageToolbar(w) {
     renderRoomView();
   });
   on('#slides-library', () => pickSlidesFromLibrary());
+  on('#support-open', () => pickSupport());
   view.querySelectorAll('[data-mode]').forEach(b => b.addEventListener('click', () => setStageMode(b.dataset.mode)));
   view.querySelectorAll('[data-slide]').forEach(b => b.addEventListener('click', () => changeSlide(Number(b.dataset.slide))));
   const input = view.querySelector('#slides-input');
   if (input) input.addEventListener('change', () => loadSlides([...input.files]));
 
-  if (w.status === 'en_direct') {
+  if (w.status === 'en_direct' && room.video === 'off') {
     ensureCamera();
     renderStage();
   }

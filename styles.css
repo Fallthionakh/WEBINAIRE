@@ -428,6 +428,11 @@ tr:last-child td { border-bottom: 0; }
 }
 .stage:fullscreen { border-radius: 0; }
 
+/* Visio Daily : plus haute que la scène 16/9 pour laisser la place à la grille des participants. */
+.stage.video { aspect-ratio: auto; height: min(72vh, 680px); min-height: 360px; }
+.video-stage { position: absolute; inset: 0; display: grid; place-items: center; }
+.video-stage iframe { width: 100%; height: 100%; border: 0; }
+
 .stage-tools { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 
 .side-panel { display: flex; flex-direction: column; min-height: 520px; padding: 16px; }
