@@ -400,6 +400,12 @@ tr:last-child td { border-bottom: 0; }
 .room { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr) 360px; }
 @media (max-width: 1000px) { .room { grid-template-columns: minmax(0, 1fr); } }
 
+/* « Agrandir » : la vidéo prend toute la largeur, le panneau passe dessous. */
+.room.wide { grid-template-columns: minmax(0, 1fr); }
+.room.wide .stage.video { height: min(86vh, 900px); }
+.room.wide .stage:not(.video) { aspect-ratio: 16 / 9; }
+.stage:fullscreen.video, .stage:-webkit-full-screen { height: 100vh; }
+
 .stage {
   position: relative;
   aspect-ratio: 16 / 9;
