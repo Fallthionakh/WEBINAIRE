@@ -46,7 +46,7 @@ passe n'est stocké dans le code.
 
 1. Créer un projet sur [supabase.com](https://supabase.com) (offre gratuite).
 2. Dans **SQL Editor**, exécuter dans l'ordre `supabase/schema.sql`, `supabase/002_approbation_connexions.sql`
-   `supabase/003_inscriptions_ressources.sql` et `supabase/004_salle_attente.sql`.
+   `supabase/003_inscriptions_ressources.sql`, `supabase/004_salle_attente.sql` et `supabase/005_mot_de_passe.sql`.
 3. Dans **Authentication → Sign In / Providers → Email**, désactiver *Confirm email*
    (ou configurer un serveur SMTP pour garder la confirmation).
 4. Dans **Authentication → Users → Add user**, créer le compte administrateur
@@ -56,6 +56,8 @@ passe n'est stocké dans le code.
 7. Visio : créer un compte [Daily](https://www.daily.co), ajouter sa clé API dans
    **Edge Functions → Secrets** sous le nom `DAILY_API_KEY`, puis déployer
    `supabase/functions/daily-token/index.ts` sous le nom `daily-token` (vérification JWT activée).
+8. Mot de passe oublié : déployer `supabase/functions/admin-reset-password/index.ts` sous le nom
+   `admin-reset-password` (aucun secret à ajouter : la clé secrète du projet est fournie par Supabase).
 
 Pour une présentation PowerPoint pendant le direct, exportez-la d'abord en PDF
 (*Fichier → Exporter → PDF*). Les PDF sont affichés avec

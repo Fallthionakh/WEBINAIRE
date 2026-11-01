@@ -277,6 +277,8 @@ async function route() {
   }
 
   startAppSession();
+  // Mot de passe provisoire donné par l'administrateur : il faut en choisir un nouveau.
+  if (session.user?.user_metadata?.must_change_password) return renderForcePassword();
   if (profile.status === 'en_attente') {
     // Compte pas encore validé : il peut quand même demander à entrer dans une salle par un lien.
     const room = hash.match(/^#\/salle\/([\w-]+)$/);
@@ -384,6 +386,38 @@ function renderShell(hash) {
   document.querySelectorAll('.scrim').forEach(s => s.remove());
 }
 
+function renderForcePassword() {
+  app.innerHTML = `<div class="auth-panel" style="min-height:100vh"><div class="card auth-card stack">
+    <div style="font-size:2.4rem;text-align:center">🔑</div>
+    <h2 style="text-align:center">Choisissez votre nouveau mot de passe</h2>
+    <p class="muted" style="text-align:center">Vous vous êtes connecté avec un mot de passe provisoire.
+      Choisissez maintenant votre propre mot de passe (8 caractères minimum).</p>
+    <form id="force-pwd" class="form">
+      <label>Nouveau mot de passe<input name="password" type="password" minlength="8" required autocomplete="new-password"></label>
+      <label>Confirmer<input name="confirm" type="password" minlength="8" required autocomplete="new-password"></label>
+      <button class="btn primary block" type="submit">Enregistrer et continuer</button>
+    </form>
+    <button class="btn ghost" id="logout-now">Se déconnecter</button>
+  </div></div>`;
+  document.getElementById('logout-now').addEventListener('click', logout);
+  const form = document.getElementById('force-pwd');
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    if (form.password.value !== form.confirm.value) return toast('Les deux mots de passe ne correspondent pas.', 'error');
+    const btn = form.querySelector('button');
+    btn.disabled = true;
+    const { data, error } = await sb.auth.updateUser({
+      password: form.password.value,
+      data: { must_change_password: false }
+    });
+    btn.disabled = false;
+    if (error) return fail(error);
+    if (data?.user) session.user = data.user;
+    toast('Mot de passe enregistré ✓', 'success');
+    route();
+  });
+}
+
 // Compte en attente d'approbation ou suspendu : aucun accès à la plateforme.
 function renderBlocked() {
   const pending = profile.status === 'en_attente';
@@ -468,7 +502,7 @@ function renderAuth(mode) {
     login: ['Bon retour 👋', 'Connectez-vous à votre espace.'],
     signup: ['Créer un compte', 'Les apprenants s’inscrivent ici ; leur compte est ensuite validé par l’administrateur. ' +
       'Les encadreurs utilisent l’e-mail invité par l’administrateur.'],
-    forgot: ['Mot de passe oublié', 'Recevez un lien pour choisir un nouveau mot de passe.']
+    forgot: ['Mot de passe oublié ?', 'Pas de panique : indiquez l’e-mail de votre compte, nous prévenons l’administrateur.']
   };
   const [title, subtitle] = titles[mode];
   let invited = false;
@@ -500,11 +534,15 @@ function renderAuth(mode) {
           <form id="auth-form" class="form">
             ${mode === 'signup' ? '<label>Nom complet<input name="full_name" required maxlength="80" autocomplete="name"></label>' : ''}
             <label>E-mail<input name="email" type="email" required autocomplete="email"></label>
-            ${mode !== 'forgot' ? `<label>Mot de passe<input name="password" type="password" required minlength="6"
-              autocomplete="${mode === 'signup' ? 'new-password' : 'current-password'}"></label>` : ''}
+            ${mode !== 'forgot' ? `<label>Mot de passe
+              <div class="pwd-field"><input name="password" type="password" required minlength="6"
+                autocomplete="${mode === 'signup' ? 'new-password' : 'current-password'}">
+                <button type="button" class="btn ghost sm" id="toggle-pwd" aria-label="Afficher le mot de passe">👁</button></div>
+              </label>` : ''}
             <button class="btn primary block" type="submit">${
-              mode === 'login' ? 'Se connecter' : mode === 'signup' ? 'Créer mon compte' : 'Envoyer le lien'}</button>
+              mode === 'login' ? 'Se connecter' : mode === 'signup' ? 'Créer mon compte' : 'Demander un nouveau mot de passe'}</button>
           </form>
+          <div id="auth-help"></div>
           <div class="stack" style="margin-top:20px;text-align:center">
             ${mode === 'login' ? `
               <a href="#/mot-de-passe-oublie">Mot de passe oublié ?</a>
@@ -516,15 +554,36 @@ function renderAuth(mode) {
     </div>`;
 
   const form = document.getElementById('auth-form');
+  const help = document.getElementById('auth-help');
+  const toggle = document.getElementById('toggle-pwd');
+  if (toggle) toggle.addEventListener('click', () => {
+    const input = form.password;
+    input.type = input.type === 'password' ? 'text' : 'password';
+    toggle.textContent = input.type === 'password' ? '👁' : '🙈';
+  });
   form.addEventListener('submit', async e => {
     e.preventDefault();
-    const btn = form.querySelector('button');
+    const btn = form.querySelector('[type=submit]');
     const d = new FormData(form);
     const email = d.get('email').trim().toLowerCase();
     btn.disabled = true;
     try {
       if (mode === 'login') {
         const { error } = await sb.auth.signInWithPassword({ email, password: d.get('password') });
+        if (error && /Invalid login credentials/i.test(error.message)) {
+          // Même message que l'e-mail existe ou non (on ne révèle pas les comptes) : on aide à trouver la cause.
+          help.innerHTML = `
+            <div class="notice warn" style="margin-top:16px">
+              <strong>E-mail ou mot de passe incorrect.</strong>
+              <ul style="margin:8px 0 0;padding-left:18px">
+                <li>Vérifiez l’e-mail et les majuscules du mot de passe (bouton 👁 pour l’afficher).</li>
+                <li>Vous avez été invité comme encadreur ? Votre compte n’existe qu’après
+                  <a href="#/inscription">la création de votre compte</a> avec cet e-mail.</li>
+                <li>Mot de passe oublié ? <a href="#/mot-de-passe-oublie">Demandez-en un nouveau</a>.</li>
+              </ul>
+            </div>`;
+          return;
+        }
         if (error) throw error;
       } else if (mode === 'signup') {
         const { data, error } = await sb.auth.signUp({
@@ -538,9 +597,24 @@ function renderAuth(mode) {
           location.hash = '#/connexion';
         }
       } else {
-        const { error } = await sb.auth.resetPasswordForEmail(email, { redirectTo: SITE_URL + '#/profil' });
+        // 1) l'administrateur est prévenu ; 2) un e-mail de réinitialisation est tenté
+        // (l'envoi d'e-mails de Supabase est limité : il peut ne pas arriver).
+        const { error } = await sb.rpc('request_password_help', { p_email: email });
         if (error) throw error;
-        toast('Si un compte existe, un e-mail vient d’être envoyé.', 'success');
+        sb.auth.resetPasswordForEmail(email, { redirectTo: SITE_URL + '#/profil' }).catch(() => {});
+        form.hidden = true;
+        help.innerHTML = `
+          <div class="notice" style="margin-top:8px">
+            <strong>✓ Demande envoyée</strong>
+            <p style="margin:8px 0">Si un compte existe avec <strong>${esc(email)}</strong> :</p>
+            <ol style="margin:0;padding-left:18px">
+              <li>l’administrateur a été prévenu et va vous transmettre un <strong>mot de passe provisoire</strong>
+                (par WhatsApp, SMS ou e-mail) ;</li>
+              <li>vous pourriez aussi recevoir un e-mail avec un lien (pensez aux spams) ;</li>
+              <li>à votre prochaine connexion, vous choisirez un nouveau mot de passe.</li>
+            </ol>
+          </div>
+          <a class="btn primary block" href="#/connexion" style="margin-top:16px">Retour à la connexion</a>`;
       }
     } catch (err) {
       fail(err);
@@ -579,18 +653,24 @@ async function viewDashboard(view, token) {
 
     if (profile.role === 'admin') {
       const head = { count: 'exact', head: true };
-      const [enc, app_, waiting, web, live, res] = await Promise.all([
+      const [enc, app_, waiting, web, live, res, pwd] = await Promise.all([
         count(sb.from('profiles').select('id', head).eq('role', 'encadreur')),
         count(sb.from('profiles').select('id', head).eq('role', 'apprenant')),
         count(sb.from('profiles').select('id', head).eq('status', 'en_attente')),
         count(sb.from('webinars').select('id', head).neq('status', 'annule')),
         count(sb.from('webinars').select('id', head).eq('status', 'en_direct')),
-        count(sb.from('resources').select('id', head))
+        count(sb.from('resources').select('id', head)),
+        count(sb.from('password_requests').select('id', head).eq('status', 'en_attente')).catch(() => 0)
       ]);
       if (waiting) {
-        alertHtml = `<a class="notice warn" href="#/utilisateurs" style="display:block;margin-bottom:24px">
+        alertHtml = `<a class="notice warn" href="#/utilisateurs" style="display:block;margin-bottom:12px">
           ⏳ ${waiting} inscription${waiting > 1 ? 's' : ''} en attente de validation → Voir</a>`;
       }
+      if (pwd) {
+        alertHtml += `<a class="notice warn" href="#/utilisateurs" style="display:block;margin-bottom:12px">
+          🔑 ${pwd} demande${pwd > 1 ? 's' : ''} de mot de passe oublié → Voir</a>`;
+      }
+      if (alertHtml) alertHtml += '<div style="height:12px"></div>';
       stats = statCard('🧑‍🏫', 'Encadreurs', enc) + statCard('🎓', 'Apprenants', app_) +
         statCard('⏳', 'En attente', waiting) + statCard('🎥', 'Webinaires', web) +
         statCard('🔴', 'En direct', live) + statCard('📚', 'Ressources', res);
@@ -2866,12 +2946,16 @@ async function uploadDialog(onDone, presetWebinarId = '') {
 // =====================================================================
 
 async function viewAdmin(view, token) {
-  const [{ data: users, error: e1 }, { data: invites, error: e2 }] = await Promise.all([
+  const [{ data: users, error: e1 }, { data: invites, error: e2 }, { data: pwdRequests }] = await Promise.all([
     sb.from('profiles').select('*').order('created_at', { ascending: false }),
-    sb.from('invitations').select('*').order('created_at', { ascending: false })
+    sb.from('invitations').select('*').order('created_at', { ascending: false }),
+    sb.from('password_requests').select('id, email, user_id, created_at, user:profiles!user_id(full_name)')
+      .eq('status', 'en_attente').order('created_at')
   ]);
   if (isStale(token)) return;
   if (e1 || e2) return (view.innerHTML = `<div class="notice danger">${esc(translateError(e1 || e2))}</div>`);
+  // Une seule ligne par personne, même si elle a fait plusieurs demandes.
+  const pwdList = [...new Map((pwdRequests || []).map(r => [r.user_id, r])).values()];
 
   const known = new Set(users.map(u => u.email));
   const pending = invites.filter(i => !known.has(i.email));
@@ -2891,6 +2975,17 @@ async function viewAdmin(view, token) {
     <div class="page-head">
       <div><h1>Utilisateurs</h1><p class="muted">Créez les encadreurs et gérez les accès.</p></div>
     </div>
+    ${pwdList.length ? `<div class="card" style="margin-bottom:16px">
+      <h2>🔑 Mots de passe oubliés (${pwdList.length})</h2>
+      <div class="list">${pwdList.map(r => `
+        <div class="list-item">
+          <div class="avatar sm">${esc(initials(r.user?.full_name || r.email))}</div>
+          <div class="grow"><strong>${esc(r.user?.full_name || r.email)}</strong>
+            <div class="muted small">${esc(r.email)} · demande du ${esc(fmtShortDate(r.created_at))} à ${esc(fmtTime(r.created_at))}</div></div>
+          <button class="btn primary sm" data-reset="${r.user_id}">Générer un mot de passe provisoire</button>
+          <button class="btn ghost sm" data-ignore="${r.user_id}">Ignorer</button>
+        </div>`).join('')}</div>
+    </div>` : ''}
     <div class="two-cols">
       <div class="card">
         <h2>🧑‍🏫 Ajouter un encadreur</h2>
@@ -2995,6 +3090,14 @@ async function viewAdmin(view, token) {
 
   view.querySelectorAll('[data-share]').forEach(b => b.addEventListener('click', () =>
     shareInvite(b.dataset.share, b.dataset.name)));
+  view.querySelectorAll('[data-reset]').forEach(b => b.addEventListener('click', () =>
+    resetUserPassword(users.find(u => u.id === b.dataset.reset) || { id: b.dataset.reset }, () => route())));
+  view.querySelectorAll('[data-ignore]').forEach(b => b.addEventListener('click', async () => {
+    const { error } = await sb.from('password_requests').update({ status: 'annulee', handled_at: new Date().toISOString() })
+      .eq('user_id', b.dataset.ignore).eq('status', 'en_attente');
+    if (error) return fail(error);
+    route();
+  }));
   view.querySelectorAll('[data-revoke]').forEach(b => b.addEventListener('click', async () => {
     if (!await confirmDialog(`Retirer l’invitation de ${b.dataset.revoke} ?`, { confirmLabel: 'Retirer', danger: true })) return;
     const { error } = await sb.from('invitations').delete().eq('email', b.dataset.revoke);
@@ -3102,8 +3205,11 @@ async function showUserProfile(u, onChange) {
     </div>
     <div class="actions">
       ${sessions.length ? '<button class="btn" id="export-sessions">⬇️ Exporter les connexions</button>' : ''}
+      ${u.id === profile.id ? '' : '<button class="btn" id="reset-pwd">🔑 Mot de passe provisoire</button>'}
       ${u.id === profile.id ? '' : statusButton(u)}
     </div>`, { wide: true });
+  const resetBtn = modal.querySelector('#reset-pwd');
+  if (resetBtn) resetBtn.addEventListener('click', () => resetUserPassword(u));
 
   modal.querySelectorAll('[data-ptab]').forEach(b => b.addEventListener('click', () => {
     modal.querySelectorAll('[data-ptab]').forEach(x => x.classList.toggle('active', x === b));
@@ -3122,6 +3228,49 @@ async function showUserProfile(u, onChange) {
     if (onChange) onChange();
     showUserProfile(u, onChange);
   });
+}
+
+// Admin : génère un mot de passe provisoire (fonction serveur) et prépare le message à envoyer.
+async function resetUserPassword(u, onDone) {
+  const name = u.full_name || u.email || 'cet utilisateur';
+  if (!await confirmDialog(`Générer un mot de passe provisoire pour ${name} ?`, {
+    confirmLabel: 'Générer'
+  })) return;
+  openModal(loading('Génération du mot de passe…'));
+  let password;
+  try {
+    const { data, error } = await sb.functions.invoke('admin-reset-password', { body: { user_id: u.id } });
+    if (error) {
+      let detail = error.message;
+      try { detail = (await error.context.json()).error || detail; } catch (e) { /* réponse non JSON */ }
+      if (/Failed to send|non-2xx|404/i.test(detail) && !/Réservé|connecté/i.test(detail)) {
+        detail = 'la fonction « admin-reset-password » n’est pas encore déployée dans Supabase.';
+      }
+      throw new Error(detail);
+    }
+    password = data.password;
+  } catch (err) {
+    closeModal();
+    return toast(`Impossible de générer le mot de passe : ${err.message}`, 'error');
+  }
+  const text = `Bonjour ${u.full_name || ''},\n\nVoici votre mot de passe provisoire pour la plateforme WEBINAIRE : ${password}\n` +
+    `Connectez-vous ici : ${SITE_URL}\nAdresse e-mail : ${u.email || ''}\n` +
+    `Vous devrez choisir un nouveau mot de passe dès votre connexion.`;
+  openModal(`
+    <h2>🔑 Mot de passe provisoire</h2>
+    <p class="muted">Transmettez-le à ${esc(name)} par un moyen sûr (WhatsApp, SMS, appel). Il ne sera plus affiché ensuite.</p>
+    <div class="notice" style="font:600 1.4rem/1.4 Consolas, monospace;text-align:center;letter-spacing:.05em">${esc(password)}</div>
+    <textarea rows="6" readonly>${esc(text)}</textarea>
+    <div class="actions">
+      ${u.email ? `<a class="btn" href="mailto:${esc(u.email)}?subject=${encodeURIComponent('Votre mot de passe provisoire WEBINAIRE')}&body=${encodeURIComponent(text)}">✉️ E-mail</a>` : ''}
+      <a class="btn" href="https://wa.me/?text=${encodeURIComponent(text)}" target="_blank" rel="noopener">💬 WhatsApp</a>
+      <button class="btn primary" id="copy-pwd">📋 Copier le message</button>
+    </div>`);
+  modal.querySelector('#copy-pwd').addEventListener('click', async () => {
+    await navigator.clipboard.writeText(text);
+    toast('Message copié ✓', 'success');
+  });
+  if (onDone) onModalClose = onDone;
 }
 
 function shareInvite(email, name, onClose) {
