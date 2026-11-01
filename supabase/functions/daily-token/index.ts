@@ -18,6 +18,17 @@ const cors = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS'
 };
 
+// Clé publique du projet : la nouvelle clé « publishable » si elle existe,
+// sinon l'ancienne clé « anon ».
+function publicKey(): string {
+  try {
+    const keys = JSON.parse(Deno.env.get('SUPABASE_PUBLISHABLE_KEYS') ?? '{}');
+    const first = Object.values(keys)[0];
+    if (typeof first === 'string' && first) return first;
+  } catch (_) { /* variable absente ou mal formée */ }
+  return Deno.env.get('SUPABASE_ANON_KEY') ?? '';
+}
+
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { ...cors, 'Content-Type': 'application/json' } });
 }
@@ -33,7 +44,7 @@ Deno.serve(async req => {
     if (!webinar_id) return json({ error: 'Webinaire manquant.' }, 400);
 
     // Client Supabase au nom de la personne connectée : les règles RLS s'appliquent.
-    const sb = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_ANON_KEY')!, {
+    const sb = createClient(Deno.env.get('SUPABASE_URL')!, publicKey(), {
       global: { headers: { Authorization: req.headers.get('Authorization') ?? '' } }
     });
     const { data: { user } } = await sb.auth.getUser();
