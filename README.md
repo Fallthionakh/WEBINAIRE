@@ -46,3 +46,14 @@ index.html   page principale
 styles.css   styles (thème clair / sombre)
 app.js       logique de l'application
 ```
+
+## Feuille de route
+
+- [x] Prototype front-end (ce dépôt)
+- [ ] Migration vers Next.js + TypeScript + TailwindCSS
+- [ ] API Node.js avec authentification JWT / OAuth2
+- [ ] Base PostgreSQL pour les utilisateurs et les webinaires
+- [ ] Chat et sondages en temps réel avec Socket.io + Redis
+- [ ] Diffusion vidéo WebRTC vers les participants
+- [ ] Enregistrement des replays (S3 / MinIO)
+- [ ] Paiement en ligne des webinaires payants

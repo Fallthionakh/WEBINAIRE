@@ -1,0 +1,23 @@
+# Systèmes d'exploitation
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Éditeurs
+.vscode/
+.idea/
+*.swp
+
+# Dépendances et builds (pour la future version Next.js / Node.js)
+node_modules/
+dist/
+build/
+.next/
+
+# Secrets et configuration locale
+.env
+.env.*
+!.env.example
+
+# Journaux
+*.log
