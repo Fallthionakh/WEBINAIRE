@@ -460,6 +460,35 @@ tr:last-child td { border-bottom: 0; }
 .poll-opt span { position: relative; z-index: 1; }
 .poll-opt.mine { border-color: var(--primary); }
 
+/* ---------- Agenda (FullCalendar) ---------- */
+
+#agenda {
+  --fc-border-color: var(--border);
+  --fc-page-bg-color: var(--surface);
+  --fc-neutral-bg-color: var(--surface-2);
+  --fc-list-event-hover-bg-color: var(--surface-2);
+  --fc-today-bg-color: var(--primary-soft);
+  --fc-button-bg-color: var(--surface-2);
+  --fc-button-border-color: var(--border);
+  --fc-button-text-color: var(--text);
+  --fc-button-hover-bg-color: var(--primary-soft);
+  --fc-button-hover-border-color: var(--primary);
+  --fc-button-active-bg-color: var(--primary);
+  --fc-button-active-border-color: var(--primary);
+  font-size: .9rem;
+}
+#agenda .fc-button { border-radius: 8px; font-weight: 600; text-transform: none; box-shadow: none; }
+#agenda .fc-button-active { color: #fff; }
+#agenda .fc-toolbar-title { font-size: 1.15rem; font-weight: 700; text-transform: capitalize; }
+#agenda .fc-event { cursor: pointer; border-radius: 6px; }
+#agenda .fc-daygrid-day { cursor: pointer; }
+#agenda .ev-cancelled .fc-event-title, #agenda .ev-cancelled .fc-list-event-title { text-decoration: line-through; }
+#agenda a { color: inherit; }
+@media (max-width: 700px) {
+  #agenda .fc-toolbar { flex-wrap: wrap; gap: 8px; }
+  #agenda .fc-toolbar-title { font-size: 1rem; }
+}
+
 /* ---------- Bibliothèque ---------- */
 
 .rcard { display: flex; flex-direction: column; gap: 10px; }

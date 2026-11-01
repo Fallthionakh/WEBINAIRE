@@ -234,6 +234,7 @@ function dateBox(iso) {
 async function route() {
   const token = ++renderToken;
   await leaveRoom();
+  destroyAgenda();
   closeModal();
   let hash = location.hash || '#/';
   if (/access_token|error=/.test(hash)) hash = '#/';
@@ -760,7 +761,8 @@ async function viewWebinars(view, token) {
         `<button class="chip ${k === filter ? 'active' : ''}" data-filter="${k}">${l}</button>`).join('')}</div>
       <input class="search" id="search" type="search" placeholder="Rechercher un webinaire…">
     </div>
-    <div id="results"></div>`;
+    <div id="results"></div>
+    <div id="agenda-card"></div>`;
 
   const draw = () => {
     const now = new Date().toISOString();
@@ -792,6 +794,161 @@ async function viewWebinars(view, token) {
     draw();
   });
   view.querySelector('#search').addEventListener('input', e => { search = e.target.value.trim().toLowerCase(); draw(); });
+
+  // Agenda : l'encadreur voit ses webinaires, l'admin tous ; l'apprenant ne voit que
+  // les webinaires auxquels son inscription est approuvée (pas d'agenda s'il n'en a aucun).
+  const agendaItems = profile.role === 'apprenant'
+    ? webinars.filter(w => regMap.get(w.id)?.status === 'approuve')
+    : webinars;
+  if (agendaItems.length || isStaff()) renderAgenda(view.querySelector('#agenda-card'), agendaItems, token);
+}
+
+// =====================================================================
+// Agenda (FullCalendar) : jour, semaine, mois, liste ; glisser pour reprogrammer
+// =====================================================================
+
+const FULLCALENDAR_URL = 'https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js';
+const FULLCALENDAR_FR_URL = 'https://cdn.jsdelivr.net/npm/@fullcalendar/core@6.1.15/locales/fr.global.min.js';
+let fullCalendarPromise = null;
+let agendaCalendar = null;
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = src;
+    script.onload = resolve;
+    script.onerror = () => reject(new Error(`Impossible de charger ${src}`));
+    document.head.append(script);
+  });
+}
+
+function loadFullCalendar() {
+  if (!fullCalendarPromise) {
+    fullCalendarPromise = loadScript(FULLCALENDAR_URL)
+      .then(() => loadScript(FULLCALENDAR_FR_URL))
+      .then(() => window.FullCalendar)
+      .catch(err => { fullCalendarPromise = null; throw err; });
+  }
+  return fullCalendarPromise;
+}
+
+function destroyAgenda() {
+  if (agendaCalendar) {
+    agendaCalendar.destroy();
+    agendaCalendar = null;
+  }
+}
+
+const AGENDA_COLORS = { planifie: '#4f46e5', en_direct: '#e11d48', termine: '#6b7280', annule: '#9ca3af' };
+
+function agendaEvent(w) {
+  return {
+    id: w.id,
+    title: w.title,
+    start: w.starts_at,
+    end: w.ends_at,
+    color: AGENDA_COLORS[w.status],
+    classNames: w.status === 'annule' ? ['ev-cancelled'] : [],
+    // Seul l'organisateur peut déplacer un webinaire encore planifié.
+    editable: canManage(w) && w.status === 'planifie',
+    durationEditable: false,
+    extendedProps: { webinar: w }
+  };
+}
+
+async function renderAgenda(box, items, token) {
+  box.innerHTML = `
+    <div class="card" style="margin-top:24px">
+      <div class="row spread" style="margin-bottom:12px">
+        <h2 style="margin:0">📅 Agenda</h2>
+        ${isStaff() ? '<span class="muted small">Glissez un webinaire planifié pour le reprogrammer.</span>' : ''}
+      </div>
+      <div id="agenda">${loading('Chargement de l’agenda…')}</div>
+    </div>`;
+  let FC;
+  try {
+    FC = await loadFullCalendar();
+  } catch (err) {
+    if (!isStale(token)) box.querySelector('#agenda').innerHTML = `<div class="notice danger">${esc(err.message)}</div>`;
+    return;
+  }
+  if (isStale(token)) return;
+  const el = box.querySelector('#agenda');
+  el.innerHTML = '';
+  destroyAgenda();
+  const narrow = window.matchMedia('(max-width: 700px)').matches;
+  agendaCalendar = new FC.Calendar(el, {
+    locale: 'fr',
+    initialView: narrow ? 'listWeek' : 'dayGridMonth',
+    headerToolbar: narrow
+      ? { left: 'prev,next', center: 'title', right: 'today' }
+      : { left: 'prev,next today', center: 'title', right: 'timeGridDay,timeGridWeek,dayGridMonth,listMonth' },
+    footerToolbar: narrow ? { center: 'timeGridDay,listWeek,dayGridMonth' } : false,
+    buttonText: { listMonth: 'Liste', listWeek: 'Semaine' },
+    height: 'auto',
+    nowIndicator: true,
+    slotMinTime: '06:00:00',
+    slotMaxTime: '23:00:00',
+    allDaySlot: false,
+    eventTimeFormat: { hour: '2-digit', minute: '2-digit' },
+    noEventsText: 'Aucun webinaire sur cette période.',
+    events: items.map(agendaEvent),
+    // Ouvrir une date : la liste des webinaires de ce jour.
+    dateClick: info => agendaCalendar.changeView('listDay', info.dateStr),
+    navLinks: true,
+    navLinkDayClick: date => agendaCalendar.changeView('listDay', date),
+    eventClick: info => {
+      info.jsEvent.preventDefault();
+      agendaDetails(info.event.extendedProps.webinar);
+    },
+    eventDrop: info => agendaReschedule(info)
+  });
+  agendaCalendar.render();
+}
+
+// Détails d'un webinaire depuis l'agenda.
+function agendaDetails(w) {
+  const live = w.status === 'en_direct';
+  openModal(`
+    <div class="row spread"><div class="row">${statusBadge(w)}</div><button class="btn ghost" data-close aria-label="Fermer">✕</button></div>
+    <h2 style="margin:0">${esc(w.title)}</h2>
+    <div class="info-grid">
+      <div><div class="k">Date</div><div class="v">${esc(fmtDate(w.starts_at))}</div></div>
+      <div><div class="k">Horaire</div><div class="v">${esc(fmtTime(w.starts_at))} – ${esc(fmtTime(w.ends_at))}</div></div>
+      <div><div class="k">Durée</div><div class="v">${esc(fmtMinutes(w.duration_minutes))}</div></div>
+      <div><div class="k">Encadreur</div><div class="v">${esc(w.encadreur?.full_name || '')}</div></div>
+    </div>
+    ${w.description ? `<p class="muted" style="white-space:pre-line">${esc(w.description)}</p>` : ''}
+    ${w.status === 'annule' && w.cancel_reason ? `<div class="notice danger">Annulé : ${esc(w.cancel_reason)}</div>` : ''}
+    <div class="actions">
+      ${canManage(w) && w.status === 'planifie' ? `<a class="btn" href="#/webinaires/${w.id}/reprogrammer" data-close>🗓️ Reprogrammer</a>` : ''}
+      <a class="btn ${live ? '' : 'primary'}" href="#/webinaires/${w.id}" data-close>Voir le webinaire</a>
+      ${live ? `<a class="btn live" href="#/salle/${w.id}" data-close>Rejoindre</a>` : ''}
+    </div>`);
+}
+
+// Glisser-déposer : reprogrammer en gardant la même durée.
+async function agendaReschedule(info) {
+  const w = info.event.extendedProps.webinar;
+  const start = info.event.start;
+  if (start < new Date()) {
+    info.revert();
+    return toast('Impossible de reprogrammer dans le passé.', 'error');
+  }
+  const ok = await confirmDialog(`Reprogrammer « ${w.title} » au ${fmtDate(start.toISOString())} à ${fmtTime(start.toISOString())} ?`, {
+    confirmLabel: 'Reprogrammer'
+  });
+  if (!ok) return info.revert();
+  const { data, error } = await sb.from('webinars').update({ starts_at: start.toISOString() })
+    .eq('id', w.id).select().single();
+  if (error) {
+    info.revert();
+    return fail(error);
+  }
+  Object.assign(w, data);
+  info.event.setExtendedProp('webinar', w);
+  info.event.setEnd(data.ends_at);
+  toast('Webinaire reprogrammé ✓ Les inscrits verront la nouvelle date.', 'success');
 }
 
 // Boutons des cartes : « S'inscrire », « Se désinscrire » et demandes à valider.
