@@ -4,7 +4,7 @@
 // appliqués par la base (voir supabase/schema.sql), pas seulement ici.
 
 // Version du site : à changer à chaque mise à jour, ici, dans version.json et dans index.html.
-const APP_VERSION = '2026-11-02-6';
+const APP_VERSION = '2026-11-02-7';
 
 const CONFIG = window.WEBINAIRE_CONFIG || {};
 const configured = Boolean(CONFIG.supabaseUrl && CONFIG.supabaseKey && window.supabase);
@@ -1613,7 +1613,7 @@ function emptyRoom() {
     sharesSeen: new Set(),
     remoteShares: new Map(), // projections des autres : user_id → { name, share, seen }
     shareSeenBy: new Set(),   // participants qui ont confirmé recevoir ma projection
-    projZoom: false,          // projection affichée en pleine largeur (défilement vertical)
+    projFollow: true,         // je suis la vue (zoom, position) de l'auteur de la projection
     shareTimer: null,
     projectionHidden: null // projection masquée par moi (valeur « at » de la projection)
   };
@@ -1992,7 +1992,8 @@ function renderShareStatus() {
 
 function broadcastShare(value = room.myShare) {
   if (!room.channel) return;
-  const share = value ? { url: value.url, kind: value.kind, name: value.name, page: value.page, count: value.count, at: value.at } : null;
+  const share = value ? { url: value.url, kind: value.kind, name: value.name, page: value.page, count: value.count, at: value.at,
+    view: value.view || null } : null;
   room.channel.send({ type: 'broadcast', event: 'share', payload: { user_id: profile.id, name: profile.full_name, share } });
 }
 
@@ -2003,6 +2004,7 @@ function onRemoteShare({ user_id, name, share }) {
   } else {
     if (!room.sharesSeen.has(share.at)) {
       room.sharesSeen.add(share.at);
+      room.projFollow = true;
       toast(`📱 ${name} montre un document`);
       // Accusé de réception : l'auteur voit combien de participants reçoivent son document.
       room.channel?.send({ type: 'broadcast', event: 'share-seen', payload: { to: user_id, from: profile.id, at: share.at } });
@@ -2044,6 +2046,16 @@ function projectionHolder() {
   return document.querySelector('#view .stage');
 }
 
+// ---------------------------------------------------------------------
+// Affichage de la projection : page entière par défaut, zoom jusqu'à ×5
+// (pincer à deux doigts, double-tap, ➖ ➕, Ctrl + molette), déplacement libre
+// dans la page, rendu redessiné net à chaque niveau de zoom.
+// L'auteur guide la vue : quand il zoome ou se déplace, les autres suivent
+// (« 📍 Suivre » pour y revenir après avoir regardé ailleurs).
+// ---------------------------------------------------------------------
+const ZOOM_MAX = 5;
+const VIEW_SEND_MS = 250;
+
 function renderProjection() {
   const p = currentProjection();
   let layer = document.getElementById('projection');
@@ -2062,9 +2074,17 @@ function renderProjection() {
   }
   const s = p.share;
   const mine = p.user_id === profile.id;
-  const key = `${s.url}|${s.page}|${s.count}|${room.isHost}|${room.projZoom}`;
-  if (layer.dataset.key === key) return;
+  layer.share = s;
+  layer.authorName = p.name;
+  const key = `${s.url}|${s.page}|${s.count}|${room.isHost}`;
+  if (layer.dataset.key === key) {
+    // Même page : seule la vue (zoom, position) de l'auteur a pu changer.
+    updateProjectionBar(layer);
+    followView(layer);
+    return;
+  }
   layer.dataset.key = key;
+  layer.proj = { base: null, z: 1, page: null, mine, kind: s.kind };
   const pages = s.kind === 'pdf' && s.count > 1
     ? (mine
       ? `<button class="btn sm" data-proj="prev" aria-label="Page précédente">◀</button><span class="small">${s.page} / ${s.count}</span>
@@ -2075,36 +2095,270 @@ function renderProjection() {
     <div class="projection-bar">
       <span class="grow">📱 <strong>${mine ? 'Vous montrez' : `${esc(p.name)} montre`}</strong> · ${esc(s.name)}</span>
       ${pages}
-      <button class="btn sm${room.projZoom ? ' active' : ''}" data-proj="zoom" title="${room.projZoom ? 'Voir la page entière' : 'Agrandir (pleine largeur, défilement)'}">${room.projZoom ? '🔍 Page entière' : '🔍 Zoom'}</button>
+      <span class="zoom-tools">
+        <button class="btn sm" data-proj="zout" aria-label="Dézoomer">➖</button>
+        <button class="btn sm zoom-level" data-proj="fit" title="Page entière">100 %</button>
+        <button class="btn sm" data-proj="zin" aria-label="Zoomer">➕</button>
+      </span>
+      ${mine ? '' : `<button class="btn sm primary" data-proj="follow" hidden>📍 Suivre ${esc(p.name)}</button>`}
       <button class="btn sm" data-proj="hide">${callActive() ? '🎥 Voir la visio' : 'Masquer'}</button>
       ${mine || room.isHost ? `<button class="btn sm danger" data-proj="stop">${mine ? 'Arrêter' : 'Fermer'}</button>` : ''}
     </div>
-    <div class="projection-body">${s.kind === 'image' ? `<img src="${esc(s.url)}" alt="${esc(s.name)}">` : '<canvas></canvas>'}</div>`;
-  layer.classList.toggle('zoom', room.projZoom);
+    <div class="projection-body"><div class="proj-stage">${s.kind === 'image'
+      ? `<img class="proj-surface" src="${esc(s.url)}" alt="${esc(s.name)}" draggable="false">`
+      : '<canvas class="proj-surface"></canvas>'}</div></div>`;
   layer.querySelectorAll('[data-proj]').forEach(b => b.addEventListener('click', () => projectionAction(b.dataset.proj, p)));
+  bindProjectionGestures(layer);
+  updateProjectionBar(layer);
+
   const body = layer.querySelector('.projection-body');
-  // Auteur d'un PDF : glisser vers la gauche ou la droite pour changer de page.
-  if (mine && s.kind === 'pdf') {
-    let x0 = null, y0 = null;
-    body.addEventListener('touchstart', e => { x0 = e.touches[0].clientX; y0 = e.touches[0].clientY; }, { passive: true });
-    body.addEventListener('touchend', e => {
-      if (x0 === null) return;
-      const dx = e.changedTouches[0].clientX - x0, dy = e.changedTouches[0].clientY - y0;
-      x0 = null;
-      if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) changeSharePage(dx < 0 ? 1 : -1);
-    });
-  }
-  if (s.kind === 'pdf') {
+  let lastW = 0, lastH = 0, timer = null;
+  new ResizeObserver(() => {
+    if (!layer.isConnected || (Math.abs(body.clientWidth - lastW) < 4 && Math.abs(body.clientHeight - lastH) < 4)) return;
+    lastW = body.clientWidth;
+    lastH = body.clientHeight;
+    clearTimeout(timer);
+    // Rotation du téléphone, plein écran, « Agrandir » : on garde le même endroit de la page.
+    timer = setTimeout(() => { const v = readView(layer); applyView(layer, v); }, 120);
+  }).observe(body);
+
+  if (s.kind === 'image') {
+    const img = layer.querySelector('img');
+    const ready = () => {
+      if (!img.naturalWidth || layer.dataset.key !== key) return;
+      layer.proj.base = { w: img.naturalWidth, h: img.naturalHeight };
+      layoutProjection(layer, { sharp: false });
+      followView(layer, true);
+    };
+    if (img.complete) ready(); else img.addEventListener('load', ready);
+  } else {
     renderProjectionPdf(layer, s, mine);
-    // Nouveau rendu net si la taille change (rotation du téléphone, plein écran, « Agrandir »).
-    let lastW = body.clientWidth, timer = null;
-    new ResizeObserver(() => {
-      if (!layer.isConnected || Math.abs(body.clientWidth - lastW) < 8) return;
-      lastW = body.clientWidth;
-      clearTimeout(timer);
-      timer = setTimeout(() => renderProjectionPdf(layer, s, mine), 150);
-    }).observe(body);
   }
+}
+
+// Vue courante : niveau de zoom et point de la page au centre de l'écran (en fractions).
+function readView(layer) {
+  const body = layer.querySelector('.projection-body');
+  return {
+    z: layer.proj.z,
+    cx: (body.scrollLeft + body.clientWidth / 2) / Math.max(1, body.scrollWidth),
+    cy: (body.scrollTop + body.clientHeight / 2) / Math.max(1, body.scrollHeight)
+  };
+}
+
+function setScroll(layer, x, y) {
+  const body = layer.querySelector('.projection-body');
+  layer.progScrollUntil = Date.now() + 200; // défilement fait par le programme, pas par la personne
+  body.scrollLeft = x;
+  body.scrollTop = y;
+  layer.progPos = { l: body.scrollLeft, t: body.scrollTop };
+}
+
+// Taille affichée = page entière × zoom. Si focal (point à l'écran) : ce point reste sous le doigt.
+function layoutProjection(layer, { focal = null, sharp = true } = {}) {
+  const P = layer.proj;
+  const body = layer.querySelector('.projection-body');
+  const surface = layer.querySelector('.proj-surface');
+  if (!P || !P.base || !body || !surface || !body.clientWidth) return;
+  let fx, fy, sx, sy;
+  if (focal) {
+    const r = body.getBoundingClientRect();
+    sx = focal.x - r.left;
+    sy = focal.y - r.top;
+    fx = (body.scrollLeft + sx) / Math.max(1, body.scrollWidth);
+    fy = (body.scrollTop + sy) / Math.max(1, body.scrollHeight);
+  }
+  const fit = Math.min((body.clientWidth - 16) / P.base.w, (body.clientHeight - 16) / P.base.h);
+  P.cssW = Math.max(40, Math.round(P.base.w * fit * P.z));
+  P.cssH = Math.max(40, Math.round(P.base.h * fit * P.z));
+  surface.style.width = `${P.cssW}px`;
+  surface.style.height = `${P.cssH}px`;
+  layer.progScrollUntil = Date.now() + 200;
+  if (focal) setScroll(layer, fx * body.scrollWidth - sx, fy * body.scrollHeight - sy);
+  updateProjectionBar(layer);
+  if (sharp) scheduleSharp(layer);
+}
+
+function applyView(layer, v) {
+  const P = layer.proj;
+  if (!P || !P.base || !v) return;
+  P.z = Math.min(ZOOM_MAX, Math.max(1, v.z || 1));
+  layoutProjection(layer);
+  const body = layer.querySelector('.projection-body');
+  setScroll(layer, (v.cx ?? 0.5) * body.scrollWidth - body.clientWidth / 2, (v.cy ?? 0.5) * body.scrollHeight - body.clientHeight / 2);
+}
+
+// L'auteur retrouve sa propre vue ; les autres suivent celle de l'auteur (sauf s'ils regardent ailleurs).
+function followView(layer, initial = false) {
+  const P = layer.proj;
+  if (!P || !P.base) return;
+  if (P.mine) { if (initial && room.myShare?.view) applyView(layer, room.myShare.view); return; }
+  if (room.projFollow && layer.share?.view) applyView(layer, layer.share.view);
+}
+
+function setZoom(layer, z, focal = null) {
+  const P = layer.proj;
+  if (!P || !P.base) return;
+  const next = Math.min(ZOOM_MAX, Math.max(1, z));
+  if (Math.abs(next - P.z) < 0.01) return;
+  P.z = next;
+  if (!focal) {
+    const r = layer.querySelector('.projection-body').getBoundingClientRect();
+    focal = { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  }
+  layoutProjection(layer, { focal });
+  viewChangedByUser(layer);
+}
+
+// La personne a zoomé ou s'est déplacée : l'auteur l'envoie aux autres ; un participant arrête de suivre.
+function viewChangedByUser(layer) {
+  const P = layer.proj;
+  if (P.mine && room.myShare) {
+    room.myShare.view = readView(layer);
+    sendViewSoon();
+  } else if (!P.mine && room.projFollow) {
+    room.projFollow = false;
+    updateProjectionBar(layer);
+  }
+}
+
+let viewTimer = null;
+let viewSentAt = 0;
+function sendViewSoon() {
+  clearTimeout(viewTimer);
+  viewTimer = setTimeout(() => { viewSentAt = Date.now(); broadcastShare(); },
+    Math.max(0, VIEW_SEND_MS - (Date.now() - viewSentAt)));
+}
+
+function updateProjectionBar(layer) {
+  const P = layer.proj;
+  if (!P) return;
+  const level = layer.querySelector('.zoom-level');
+  if (level) level.textContent = `${Math.round(P.z * 100)} %`;
+  const out = layer.querySelector('[data-proj="zout"]');
+  if (out) out.disabled = P.z <= 1.001;
+  const zin = layer.querySelector('[data-proj="zin"]');
+  if (zin) zin.disabled = P.z >= ZOOM_MAX - 0.001;
+  const follow = layer.querySelector('[data-proj="follow"]');
+  if (follow) follow.hidden = room.projFollow || !layer.share?.view;
+}
+
+function bindProjectionGestures(layer) {
+  const body = layer.querySelector('.projection-body');
+  const P = () => layer.proj;
+  const dist = (a, b) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+  const mid = (a, b) => ({ x: (a.clientX + b.clientX) / 2, y: (a.clientY + b.clientY) / 2 });
+  let pinch = null, swipe = null, lastTap = 0;
+
+  body.addEventListener('touchstart', e => {
+    if (e.touches.length === 2) {
+      pinch = { d: dist(e.touches[0], e.touches[1]), z: P().z };
+      swipe = null;
+    } else if (e.touches.length === 1 && !pinch) {
+      swipe = { x: e.touches[0].clientX, y: e.touches[0].clientY, t: Date.now() };
+    }
+  }, { passive: true });
+
+  // Pincer : zoom autour du point entre les deux doigts (le navigateur ne zoome pas toute la page).
+  body.addEventListener('touchmove', e => {
+    if (!pinch || e.touches.length !== 2) return;
+    e.preventDefault();
+    const z = Math.min(ZOOM_MAX, Math.max(1, pinch.z * dist(e.touches[0], e.touches[1]) / pinch.d));
+    if (Math.abs(z - P().z) < 0.01) return;
+    P().z = z;
+    layoutProjection(layer, { focal: mid(e.touches[0], e.touches[1]), sharp: false });
+    viewChangedByUser(layer);
+  }, { passive: false });
+
+  body.addEventListener('touchend', e => {
+    if (pinch) {
+      if (e.touches.length < 2) { pinch = null; scheduleSharp(layer); }
+      return;
+    }
+    if (!swipe) return;
+    const t = e.changedTouches[0];
+    const dx = t.clientX - swipe.x, dy = t.clientY - swipe.y, dt = Date.now() - swipe.t;
+    swipe = null;
+    if (Math.abs(dx) < 12 && Math.abs(dy) < 12 && dt < 300) {
+      // Double-tap : zoom ×2,5 à cet endroit, ou retour à la page entière.
+      if (Date.now() - lastTap < 320) {
+        lastTap = 0;
+        setZoom(layer, P().z > 1.05 ? 1 : 2.5, { x: t.clientX, y: t.clientY });
+      } else {
+        lastTap = Date.now();
+      }
+      return;
+    }
+    // Glisser à gauche/droite : page suivante/précédente (auteur, page entière seulement).
+    if (P().mine && P().kind === 'pdf' && P().z <= 1.05 && Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+      changeSharePage(dx < 0 ? 1 : -1);
+    }
+  });
+
+  body.addEventListener('dblclick', e => setZoom(layer, P().z > 1.05 ? 1 : 2.5, { x: e.clientX, y: e.clientY }));
+  body.addEventListener('wheel', e => {
+    if (!e.ctrlKey) return; // molette seule : défilement normal
+    e.preventDefault();
+    setZoom(layer, P().z * (e.deltaY < 0 ? 1.15 : 1 / 1.15), { x: e.clientX, y: e.clientY });
+  }, { passive: false });
+  // Souris : cliquer-glisser pour se déplacer dans la page zoomée.
+  let drag = null;
+  body.addEventListener('mousedown', e => {
+    if (e.button !== 0 || P().z <= 1.001) return;
+    drag = { x: e.clientX, y: e.clientY, l: body.scrollLeft, t: body.scrollTop };
+    body.classList.add('dragging');
+    e.preventDefault();
+  });
+  window.addEventListener('mousemove', e => {
+    if (!drag || !layer.isConnected) return;
+    body.scrollLeft = drag.l - (e.clientX - drag.x);
+    body.scrollTop = drag.t - (e.clientY - drag.y);
+  });
+  window.addEventListener('mouseup', () => { drag = null; body.classList.remove('dragging'); });
+  body.addEventListener('scroll', () => {
+    if (Date.now() < (layer.progScrollUntil || 0)) return;
+    // Position atteinte par le programme (suivi de l'auteur) : ce n'est pas la personne qui a bougé.
+    const pp = layer.progPos;
+    if (pp && Math.abs(body.scrollLeft - pp.l) < 2 && Math.abs(body.scrollTop - pp.t) < 2) return;
+    viewChangedByUser(layer);
+  }, { passive: true });
+}
+
+// PDF : redessiné à la résolution de l'écran pour le niveau de zoom (texte net).
+function scheduleSharp(layer) {
+  if (layer.proj?.kind !== 'pdf') return;
+  clearTimeout(layer.sharpTimer);
+  layer.sharpTimer = setTimeout(() => renderPdfSharp(layer), 180);
+}
+
+async function renderPdfSharp(layer) {
+  const P = layer.proj;
+  if (!P?.page || !P.cssW || !layer.isConnected) return;
+  const key = layer.dataset.key;
+  // Limites des navigateurs mobiles : 4096 px de côté et ~16 millions de pixels par dessin.
+  const ratio = Math.min(window.devicePixelRatio || 1, 3, 4096 / P.cssW, 4096 / P.cssH,
+    Math.sqrt(16e6 / (P.cssW * P.cssH)));
+  const viewport = P.page.getViewport({ scale: (P.cssW / P.base.w) * ratio });
+  const canvas = document.createElement('canvas');
+  canvas.className = 'proj-surface';
+  canvas.width = Math.round(viewport.width);
+  canvas.height = Math.round(viewport.height);
+  if (layer.renderTask) layer.renderTask.cancel();
+  const task = P.page.render({ canvasContext: canvas.getContext('2d'), viewport });
+  layer.renderTask = task;
+  try {
+    await task.promise;
+  } catch (e) {
+    return; // rendu remplacé par un plus récent
+  }
+  if (layer.renderTask === task) layer.renderTask = null;
+  const old = layer.querySelector('.proj-surface');
+  if (!old || layer.dataset.key !== key) return;
+  // Remplacé d'un coup (pas d'écran blanc pendant le dessin), à la taille affichée actuelle.
+  canvas.style.width = old.style.width;
+  canvas.style.height = old.style.height;
+  old.replaceWith(canvas);
+  if (Math.abs(parseFloat(old.style.width) - P.cssW) > 1) scheduleSharp(layer);
 }
 
 function renderProjectionChip(p) {
@@ -2118,13 +2372,18 @@ function renderProjectionChip(p) {
 }
 
 function projectionAction(action, p) {
+  const layer = document.getElementById('projection');
   if (action === 'hide') {
     room.projectionHidden = p.share.at;
     return renderProjection();
   }
-  if (action === 'zoom') {
-    room.projZoom = !room.projZoom;
-    return renderProjection();
+  if (layer && action === 'zin') return setZoom(layer, layer.proj.z * 1.5);
+  if (layer && action === 'zout') return setZoom(layer, layer.proj.z / 1.5);
+  if (layer && action === 'fit') return setZoom(layer, 1);
+  if (layer && action === 'follow') {
+    room.projFollow = true;
+    followView(layer);
+    return updateProjectionBar(layer);
   }
   if (action === 'prev' || action === 'next') return changeSharePage(action === 'next' ? 1 : -1);
   if (action === 'stop') {
@@ -2143,6 +2402,7 @@ function changeSharePage(delta) {
   const page = Math.min(sh.count, Math.max(1, sh.page + delta));
   if (page === sh.page) return;
   sh.page = page;
+  sh.view = { z: 1, cx: 0.5, cy: 0.5 }; // nouvelle page : affichée en entier
   broadcastShare();
   renderProjection();
   renderHandBar();
@@ -2171,30 +2431,18 @@ async function renderProjectionPdf(layer, s, mine) {
     }
     const page = await doc.getPage(Math.min(s.page, doc.numPages));
     const body = layer.querySelector('.projection-body');
-    const canvas = layer.querySelector('canvas');
-    if (!body || !canvas || layer.dataset.key !== key) return;
+    if (!body || layer.dataset.key !== key) return;
     // La zone vient d'être créée : on attend qu'elle ait une taille avant de dessiner.
     for (let i = 0; i < 20 && (!body.clientWidth || !body.clientHeight); i++) {
       await new Promise(r => requestAnimationFrame(r));
     }
     if (layer.dataset.key !== key) return;
-    const pad = 16;
-    const w = Math.max(100, body.clientWidth - pad), h = Math.max(100, body.clientHeight - pad);
     const base = page.getViewport({ scale: 1 });
-    // Page entière (par défaut) ou pleine largeur avec défilement (« Zoom »).
-    const fit = room.projZoom ? w / base.width : Math.min(w / base.width, h / base.height);
-    const ratio = Math.min(window.devicePixelRatio || 1, 2);
-    const viewport = page.getViewport({ scale: fit * ratio });
-    canvas.width = Math.round(viewport.width);
-    canvas.height = Math.round(viewport.height);
-    canvas.style.width = `${Math.round(viewport.width / ratio)}px`;
-    canvas.style.height = `${Math.round(viewport.height / ratio)}px`;
-    // Un seul dessin à la fois sur la même page (pdf.js refuse deux rendus simultanés).
-    if (layer.renderTask) layer.renderTask.cancel();
-    const task = page.render({ canvasContext: canvas.getContext('2d'), viewport });
-    layer.renderTask = task;
-    await task.promise;
-    if (layer.renderTask === task) layer.renderTask = null;
+    layer.proj.page = page;
+    layer.proj.base = { w: base.width, h: base.height };
+    layoutProjection(layer, { sharp: false });
+    followView(layer, true);
+    await renderPdfSharp(layer);
   } catch (e) {
     if (e?.name === 'RenderingCancelledException' || layer.dataset.key !== key) return;
     console.warn('Projection PDF :', e);
