@@ -495,6 +495,70 @@ tr:last-child td { border-bottom: 0; }
 
 /* ---------- Bibliothèque ---------- */
 
+.rgrid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
+.rcard2 {
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  transition: transform .15s, box-shadow .15s;
+}
+.rcard2:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(17, 24, 39, .1); }
+.rthumb {
+  position: relative;
+  height: 112px;
+  border: 0;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  font: inherit;
+  color: #fff;
+}
+.rthumb .ricon { font-size: 2.6rem; filter: drop-shadow(0 2px 6px rgba(0, 0, 0, .2)); }
+.rthumb .rtype {
+  position: absolute;
+  left: 12px;
+  top: 10px;
+  font-size: .72rem;
+  font-weight: 700;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  background: rgba(255, 255, 255, .25);
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.rthumb .rplay {
+  position: absolute;
+  right: 12px;
+  bottom: 10px;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, .9);
+  color: #111;
+  display: grid;
+  place-items: center;
+  font-size: .9rem;
+}
+.rthumb.pdf { background: linear-gradient(135deg, #ef4444, #f97316); }
+.rthumb.video { background: linear-gradient(135deg, #2563eb, #7c3aed); }
+.rthumb.presentation { background: linear-gradient(135deg, #f59e0b, #ea580c); }
+.rthumb.document { background: linear-gradient(135deg, #0ea5e9, #2563eb); }
+.rthumb.image { background: linear-gradient(135deg, #10b981, #059669); }
+.rthumb.autre { background: linear-gradient(135deg, #64748b, #334155); }
+.rbody { padding: 14px 16px 8px; display: grid; gap: 6px; flex: 1; align-content: start; }
+.rbody h3 { font-size: 1rem; line-height: 1.3; }
+.ractions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 10px 16px 14px; }
+.seg { display: inline-flex; }
+.seg .btn { border-radius: 0; }
+.seg .btn:first-child { border-radius: 8px 0 0 8px; }
+.seg .btn:last-child { border-radius: 0 8px 8px 0; }
+.card.list { padding: 4px 16px; }
+.supports .list-item { flex-wrap: wrap; }
+
 .rcard { display: flex; flex-direction: column; gap: 10px; }
 .ftype {
   width: 48px;
