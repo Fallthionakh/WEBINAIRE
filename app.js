@@ -4,7 +4,7 @@
 // appliqués par la base (voir supabase/schema.sql), pas seulement ici.
 
 // Version du site : à changer à chaque mise à jour, ici, dans version.json et dans index.html.
-const APP_VERSION = '2026-11-02-5';
+const APP_VERSION = '2026-11-02-6';
 
 const CONFIG = window.WEBINAIRE_CONFIG || {};
 const configured = Boolean(CONFIG.supabaseUrl && CONFIG.supabaseKey && window.supabase);
@@ -1769,7 +1769,10 @@ function ensureDock() {
   dock.addEventListener('click', e => {
     const b = e.target.closest('[data-dock]');
     if (!b) return;
-    if (b.dataset.dock === 'back') location.hash = `#/salle/${room.id}`;
+    if (b.dataset.dock === 'back') {
+      if (docViewer) return closeDocViewer();
+      location.hash = `#/salle/${room.id}`;
+    }
     else if (room.isHost) endLive(room.webinar);
     else quitRoom();
   });
@@ -1787,7 +1790,7 @@ function updateDock() {
   const active = callActive();
   dock.hidden = !active;
   if (!active) { renderProjection(); return stopDockSync(); }
-  const placeholder = !room.background && document.getElementById('video-stage');
+  const placeholder = !room.background && !docViewer && document.getElementById('video-stage');
   dock.classList.toggle('mini', !placeholder);
   renderProjection();
   if (placeholder) return startDockSync();
@@ -1807,7 +1810,7 @@ function updateDock() {
 // Suit la position de la scène (défilement, « Agrandir », bandeaux qui apparaissent…).
 function syncDock() {
   const ph = document.getElementById('video-stage');
-  if (!ph || room.background || !dock || dock.hidden) {
+  if (!ph || room.background || docViewer || !dock || dock.hidden) {
     dockRaf = 0;
     updateDock();
     return;
@@ -1925,23 +1928,34 @@ async function startMyShare(file) {
     const { data, error: err } = await sb.storage.from('salle').createSignedUrl(path, 6 * 3600);
     if (err) throw err;
     if (room.id !== id) return sb.storage.from('salle').remove([path]);
-    const previous = room.myShare;
-    room.myShare = {
-      url: data.signedUrl, kind: isPdf ? 'pdf' : 'image', name: file.name || 'Capture',
-      page: 1, count: 1, at: new Date().toISOString(), path
-    };
-    room.projectionHidden = null;
-    room.shareSeenBy = new Set();
-    broadcastShare();
-    renderProjection();
-    if (previous?.path) sb.storage.from('salle').remove([previous.path]);
-    toast('Votre document est affiché pour toute la salle.', 'success');
+    setMyShare({ url: data.signedUrl, kind: isPdf ? 'pdf' : 'image', name: file.name || 'Capture', path });
   } catch (e) {
     fail(e);
   } finally {
     room.shareBusy = false;
     renderHandBar();
   }
+}
+
+// Montre un document à toute la salle (path : fichier temporaire du dossier « salle » à supprimer ensuite).
+function setMyShare({ url, kind, name, path = null }) {
+  const previous = room.myShare;
+  room.myShare = { url, kind, name, page: 1, count: 1, at: new Date().toISOString(), path };
+  room.projectionHidden = null;
+  room.shareSeenBy = new Set();
+  broadcastShare();
+  renderProjection();
+  renderHandBar();
+  if (previous?.path) sb.storage.from('salle').remove([previous.path]);
+  toast('Votre document est affiché pour toute la salle.', 'success');
+}
+
+// Support du cours ou ressource de la bibliothèque montré à toute la salle (rien à téléverser).
+async function shareLibraryResource(r, type) {
+  const { data, error } = await sb.storage.from('bibliotheque').createSignedUrl(r.file_path, 6 * 3600);
+  if (error) return fail(error);
+  if (!room.id) return;
+  setMyShare({ url: data.signedUrl, kind: type === 'pdf' ? 'pdf' : 'image', name: r.title || r.file_name });
 }
 
 function stopMyShare(message) {
@@ -2190,6 +2204,109 @@ async function renderProjectionPdf(layer, s, mine) {
 }
 
 // =====================================================================
+// Ouvrir un document pendant le cours : le montrer à tous, ou le consulter
+// seul dans un lecteur intégré, la visio passant en miniature.
+// =====================================================================
+
+let docViewer = null; // { r, type, doc } quand le lecteur intégré est ouvert
+
+function askOpenInRoom(r, type) {
+  const title = r.title || r.file_name;
+  const desktop = screenShareSupported();
+  openModal(`
+    <h2 style="margin-bottom:4px">${type === 'pdf' ? '📕' : '🖼️'} ${esc(title)}</h2>
+    <p class="muted">Voulez-vous montrer ce document à toute la salle ?</p>
+    <div class="choice-list">
+      <button class="btn primary" id="open-share">📱 Oui, le montrer à tous</button>
+      <button class="btn" id="open-alone">👁 Non, le consulter seul${callActive() ? '<small>La visio continue en miniature</small>' : ''}</button>
+      ${desktop ? '<button class="btn ghost sm" id="open-tab">↗ Ouvrir dans un nouvel onglet</button>' : ''}
+      <button class="btn ghost" data-close>Annuler</button>
+    </div>`);
+  modal.querySelector('#open-share').addEventListener('click', () => { closeModal(); shareLibraryResource(r, type); });
+  modal.querySelector('#open-alone').addEventListener('click', () => { closeModal(); openDocViewer(r, type); });
+  const tab = modal.querySelector('#open-tab');
+  if (tab) tab.addEventListener('click', async () => {
+    const win = window.open('', '_blank');
+    closeModal();
+    const { data, error } = await sb.storage.from('bibliotheque').createSignedUrl(r.file_path, 3600);
+    if (error) { if (win) win.close(); return fail(error); }
+    if (win) win.location = data.signedUrl;
+  });
+}
+
+async function openDocViewer(r, type) {
+  closeDocViewer();
+  const title = r.title || r.file_name;
+  const el = document.createElement('div');
+  el.id = 'doc-viewer';
+  el.className = 'doc-viewer';
+  el.innerHTML = `
+    <div class="doc-viewer-bar">
+      <strong class="grow">${type === 'pdf' ? '📕' : '🖼️'} ${esc(title)}</strong>
+      ${room.id ? '<button class="btn sm primary" id="dv-share">📱 Montrer à tous</button>' : ''}
+      <button class="btn sm" id="dv-close">✕ Fermer</button>
+    </div>
+    <div class="doc-viewer-body">${loading('Ouverture du document…')}</div>`;
+  document.body.append(el);
+  document.body.classList.add('doc-viewer-open');
+  docViewer = { r, type, doc: null };
+  updateDock(); // la visio passe en miniature
+  el.querySelector('#dv-close').addEventListener('click', closeDocViewer);
+  const share = el.querySelector('#dv-share');
+  if (share) share.addEventListener('click', () => { closeDocViewer(); shareLibraryResource(r, type); });
+
+  const { data, error } = await sb.storage.from('bibliotheque').createSignedUrl(r.file_path, 3600);
+  const body = el.querySelector('.doc-viewer-body');
+  if (!docViewer || docViewer.r !== r) return;
+  if (error) { closeDocViewer(); return fail(error); }
+  if (type === 'image') {
+    body.innerHTML = `<img src="${esc(data.signedUrl)}" alt="${esc(title)}">`;
+    return;
+  }
+  // PDF : toutes les pages l'une sous l'autre, on fait défiler.
+  try {
+    const pdfjs = await loadPdfJs();
+    const doc = await pdfjs.getDocument({ url: data.signedUrl }).promise;
+    if (!docViewer || docViewer.r !== r) return doc.destroy();
+    docViewer.doc = doc;
+    body.innerHTML = '';
+    const width = Math.min(body.clientWidth - 16, 1000);
+    const ratio = Math.min(window.devicePixelRatio || 1, 2);
+    for (let n = 1; n <= doc.numPages; n++) {
+      if (!docViewer || docViewer.doc !== doc) return;
+      const page = await doc.getPage(n);
+      const base = page.getViewport({ scale: 1 });
+      const viewport = page.getViewport({ scale: (width / base.width) * ratio });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(viewport.width);
+      canvas.height = Math.round(viewport.height);
+      canvas.style.width = `${Math.round(viewport.width / ratio)}px`;
+      canvas.style.height = `${Math.round(viewport.height / ratio)}px`;
+      body.append(canvas);
+      const label = document.createElement('div');
+      label.className = 'doc-viewer-page';
+      label.textContent = `Page ${n} / ${doc.numPages}`;
+      body.append(label);
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+    }
+  } catch (e) {
+    if (docViewer && docViewer.r === r) body.innerHTML = '<p style="color:#fff;text-align:center">Impossible d’afficher ce PDF. Utilisez « Télécharger ».</p>';
+  }
+}
+
+function closeDocViewer() {
+  if (!docViewer) return;
+  if (docViewer.doc) docViewer.doc.destroy();
+  docViewer = null;
+  document.getElementById('doc-viewer')?.remove();
+  document.body.classList.remove('doc-viewer-open');
+  updateDock(); // la visio reprend sa place dans la salle
+}
+
+// Bouton « retour » du téléphone : ferme le lecteur au lieu de quitter la page.
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && docViewer && !modal.open) closeDocViewer(); });
+
+// =====================================================================
 // Supports du cours : liste visible dans la salle (organisateur et apprenants)
 // =====================================================================
 
@@ -2226,8 +2343,8 @@ function renderSupports() {
             ${host ? `<button class="btn ghost sm" data-unlink-sup="${r.id}" title="Retirer de ce cours">✕</button>` : ''}</div>
         </div>`;
       }).join('')}</div>` : '<p class="muted small">Aucun support pour ce cours. Ajoutez vos PDF, présentations ou vidéos.</p>'}
-      ${host && list.length ? `<p class="hint" style="margin-top:8px">Pour montrer un support : <strong>👁 Voir</strong>
-        l’ouvre dans un onglet, puis dans la visio <strong>Partager l’écran</strong> → choisissez cet onglet.</p>` : ''}
+      ${list.length ? `<p class="hint" style="margin-top:8px"><strong>👁 Voir</strong> : montrer le document à toute la salle,
+        ou le consulter seul (la visio continue en miniature).</p>` : ''}
     </div>`;
   bindResourceButtons(box);
   const add = box.querySelector('#sup-add');
@@ -2623,6 +2740,7 @@ function stopAttendance() {
 async function leaveRoom() {
   if (!room.id) return;
   clearInterval(room.shareTimer);
+  closeDocViewer();
   if (room.myShare) broadcastShare(null);
   if (room.myShare?.path) sb.storage.from('salle').remove([room.myShare.path]);
   document.getElementById('projection')?.remove();
@@ -3515,6 +3633,9 @@ async function openResource(r, type, mode = 'view') {
     a.remove();
     return toast(`Téléchargement de « ${r.title || r.file_name} »…`);
   }
+  // Dans une salle : ouvrir un document ne doit jamais faire quitter la page (sur téléphone,
+  // un nouvel onglet ou une redirection coupait la visio). On demande d'abord quoi faire.
+  if (room.id && type !== 'video' && mode === 'view') return askOpenInRoom(r, type);
   // Fenêtre ouverte tout de suite pour ne pas être bloquée par le navigateur.
   const win = type === 'video' ? null : window.open('', '_blank');
   const { data, error } = await sb.storage.from('bibliotheque').createSignedUrl(r.file_path, 3600);
