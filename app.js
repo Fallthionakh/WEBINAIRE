@@ -1706,29 +1706,58 @@ function stopVideo() {
   if (room.video !== 'off') room.video = null;
 }
 
-// Ouvrir un support (PDF, PowerPoint…) dans un onglet, à montrer avec « Partager l'écran ».
-async function pickSupport() {
-  const [{ data: links }, { data: all, error }] = await Promise.all([
-    sb.from('webinar_resources').select('resource_id').eq('webinar_id', room.id),
-    sb.from('resources').select('*').order('created_at', { ascending: false })
-  ]);
-  if (error) return fail(error);
-  const linked = new Set((links || []).map(l => l.resource_id));
-  const list = [...all].sort((a, b) => (linked.has(b.id) ? 1 : 0) - (linked.has(a.id) ? 1 : 0));
-  openModal(`
-    <h2>📚 Ouvrir un support à partager</h2>
-    <p class="muted">Le support s’ouvre dans un nouvel onglet. Dans la visio, cliquez ensuite sur
-      <strong>Partager l’écran</strong> et choisissez cet onglet.</p>
-    ${list.length ? `<div class="list" style="max-height:360px;overflow-y:auto">${list.map(r => {
-      const t = fileType(r);
-      return `<div class="list-item"><div class="ftype ${t}">${FILE_TYPES[t][0]}</div>
-        <div class="grow"><strong>${esc(r.title)}</strong>
-          <div class="muted small">${FILE_TYPES[t][1]}${linked.has(r.id) ? ' · lié à ce webinaire' : ''}</div></div>
-        <button class="btn primary sm" data-open="${r.id}" data-path="${esc(r.file_path)}" data-name="${esc(r.file_name)}"
-          data-type="${t}">Ouvrir</button></div>`;
-    }).join('')}</div>` : emptyState('📚', 'La bibliothèque est vide.')}
-    <div class="actions"><button class="btn" data-close>Fermer</button></div>`);
-  bindResourceButtons(modal);
+// =====================================================================
+// Supports du cours : liste visible dans la salle (organisateur et apprenants)
+// =====================================================================
+
+async function loadSupports() {
+  const id = room.id;
+  const { data } = await sb.from('webinar_resources').select('resource:resources(*)')
+    .eq('webinar_id', id).order('created_at');
+  if (room.id !== id) return;
+  room.supports = (data || []).map(l => l.resource).filter(Boolean);
+  renderSupports();
+}
+
+function renderSupports() {
+  const box = document.getElementById('supports');
+  if (!box) return;
+  const host = room.isHost;
+  const list = room.supports || [];
+  if (!host && !list.length) { box.innerHTML = ''; return; }
+  box.innerHTML = `
+    <div class="card supports">
+      <div class="row spread" style="margin-bottom:8px">
+        <h3>📚 Supports du cours (${list.length})</h3>
+        ${host ? `<div class="row">
+          <button class="btn sm" id="sup-add">＋ Depuis la bibliothèque</button>
+          <button class="btn sm" id="sup-upload">⬆ Déposer un fichier</button></div>` : ''}
+      </div>
+      ${list.length ? `<div class="list">${list.map(r => {
+        const t = fileType(r);
+        return `<div class="list-item">
+          <div class="ftype ${t}">${FILE_TYPES[t][0]}</div>
+          <div class="grow"><strong>${esc(r.title)}</strong>
+            <div class="muted small">${FILE_TYPES[t][1]} · ${esc(fmtSize(r.size_bytes))}</div></div>
+          <div class="row" style="justify-content:flex-end">${resourceButtons(r)}
+            ${host ? `<button class="btn ghost sm" data-unlink-sup="${r.id}" title="Retirer de ce cours">✕</button>` : ''}</div>
+        </div>`;
+      }).join('')}</div>` : '<p class="muted small">Aucun support pour ce cours. Ajoutez vos PDF, présentations ou vidéos.</p>'}
+      ${host && list.length ? `<p class="hint" style="margin-top:8px">Pour montrer un support : <strong>👁 Voir</strong>
+        l’ouvre dans un onglet, puis dans la visio <strong>Partager l’écran</strong> → choisissez cet onglet.</p>` : ''}
+    </div>`;
+  bindResourceButtons(box);
+  const add = box.querySelector('#sup-add');
+  if (add) add.addEventListener('click', () => linkResourcesDialog(room.webinar, list.map(r => r.id), loadSupports));
+  const upload = box.querySelector('#sup-upload');
+  if (upload) upload.addEventListener('click', () => uploadDialog(() => loadSupports(), room.id));
+  box.querySelectorAll('[data-unlink-sup]').forEach(b => b.addEventListener('click', async () => {
+    const { error } = await sb.from('webinar_resources').delete()
+      .eq('webinar_id', room.id).eq('resource_id', b.dataset.unlinkSup);
+    if (error) return fail(error);
+    toast('Support retiré du cours.');
+    loadSupports();
+  }));
 }
 
 // Ma présence dans la salle (nom, rôle, main levée), visible des autres en temps réel.
@@ -1901,6 +1930,7 @@ async function onAdmitted() {
   room.joinedAt = new Date().toISOString();
   trackMe();
   renderRoomView();
+  loadSupports();
   if (room.webinar.status === 'en_direct') {
     startAttendance();
     startVideo();
@@ -2176,6 +2206,7 @@ function renderRoomView() {
     renderRoomMeta();
     renderHandBar();
     renderLobbyBar();
+    renderSupports();
     renderPanel();
     return;
   }
@@ -2226,6 +2257,7 @@ function renderRoomView() {
         </div>
         ${host ? stageToolbar(w) : ''}
         ${!host && w.status === 'en_direct' ? '<div class="stage-tools" id="hand-bar"></div>' : ''}
+        <div id="supports" style="margin-top:16px"></div>
       </section>
       <aside class="card side-panel">
         <div class="tabs">${tabs.map(([k, l]) =>
@@ -2244,6 +2276,7 @@ function renderRoomView() {
   bindZoomButtons(view, w);
   renderHandBar();
   renderLobbyBar();
+  renderSupports();
   renderPanel();
   startClock();
 }
@@ -2279,7 +2312,6 @@ function stageToolbar(w) {
   if (room.video !== 'off') {
     return `
       <div class="stage-tools">
-        <button class="btn" id="support-open">📚 Ouvrir un support à partager</button>
         <button class="btn danger" id="end-live">Terminer le direct</button>
       </div>
       <p class="hint" style="margin-top:8px">Dans la visio : caméra, micro, <strong>Partager l’écran</strong>,
@@ -2336,7 +2368,6 @@ function bindStageToolbar(w) {
     renderRoomView();
   });
   on('#slides-library', () => pickSlidesFromLibrary());
-  on('#support-open', () => pickSupport());
   view.querySelectorAll('[data-mode]').forEach(b => b.addEventListener('click', () => setStageMode(b.dataset.mode)));
   view.querySelectorAll('[data-slide]').forEach(b => b.addEventListener('click', () => changeSlide(Number(b.dataset.slide))));
   const input = view.querySelector('#slides-input');
@@ -2748,15 +2779,78 @@ function fileType(r) {
   return 'autre';
 }
 
+// Les types lisibles directement dans le navigateur ; les autres (PowerPoint, Word…) se téléchargent.
+const VIEWABLE = new Set(['pdf', 'image', 'video']);
+
+// Attributs communs aux boutons « Voir » et « Télécharger ».
+function resourceData(r) {
+  return `data-path="${esc(r.file_path)}" data-name="${esc(r.file_name)}" data-title="${esc(r.title)}" data-type="${fileType(r)}"`;
+}
+
+function resourceButtons(r, { small = true } = {}) {
+  const t = fileType(r);
+  const sm = small ? ' sm' : '';
+  return `${VIEWABLE.has(t) ? `<button class="btn primary${sm}" data-open="${r.id}" ${resourceData(r)}>${
+    t === 'video' ? '▶ Regarder' : '👁 Voir'}</button>` : ''}
+    <button class="btn${VIEWABLE.has(t) ? '' : ' primary'}${sm}" data-download="${r.id}" ${resourceData(r)}
+      title="Télécharger ${esc(r.file_name)}">⬇ Télécharger</button>`;
+}
+
 function resourceRow(r, removable = false) {
   const t = fileType(r);
   return `<div class="list-item">
     <div class="ftype ${t}">${FILE_TYPES[t][0]}</div>
     <div class="grow"><strong>${esc(r.title)}</strong>
       <div class="muted small">${FILE_TYPES[t][1]} · ${esc(fmtSize(r.size_bytes))}</div></div>
-    <button class="btn sm" data-open="${r.id}" data-path="${esc(r.file_path)}" data-name="${esc(r.file_name)}"
-      data-type="${t}">${t === 'video' ? '▶ Regarder' : 'Ouvrir'}</button>
-    ${removable ? `<button class="btn ghost sm" data-unlink="${r.id}" title="Retirer du webinaire">Retirer</button>` : ''}
+    <div class="row" style="justify-content:flex-end">${resourceButtons(r)}
+    ${removable ? `<button class="btn ghost sm" data-unlink="${r.id}" title="Retirer du webinaire">Retirer</button>` : ''}</div>
+  </div>`;
+}
+
+// Carte de la bibliothèque : vignette colorée par type, infos, actions.
+function resourceCard(r) {
+  const t = fileType(r);
+  const mine = r.owner_id === profile.id || profile.role === 'admin';
+  const links = (r.links || []).filter(l => l.webinar);
+  const thumbAttrs = VIEWABLE.has(t) ? `data-open="${r.id}"` : `data-download="${r.id}"`;
+  return `<article class="rcard2">
+    <button class="rthumb ${t}" ${thumbAttrs} ${resourceData(r)} title="${VIEWABLE.has(t) ? 'Voir' : 'Télécharger'}">
+      <span class="ricon">${FILE_TYPES[t][0]}</span>
+      <span class="rtype">${FILE_TYPES[t][1]}</span>
+      ${t === 'video' ? '<span class="rplay">▶</span>' : ''}
+    </button>
+    <div class="rbody">
+      <h3 class="clamp" title="${esc(r.title)}">${esc(r.title)}</h3>
+      ${r.description ? `<p class="muted small clamp">${esc(r.description)}</p>` : ''}
+      <div class="muted small">${esc(fmtSize(r.size_bytes))} · ${esc(fmtShortDate(r.created_at))}${
+        r.owner?.full_name ? ` · ${esc(r.owner.full_name)}` : ''}</div>
+      ${links.length ? `<div class="row">${links.map(l =>
+        `<a class="badge" href="#/webinaires/${l.webinar.id}">🎥 ${esc(l.webinar.title)}</a>`).join('')}</div>` : ''}
+    </div>
+    <div class="ractions">
+      ${resourceButtons(r)}
+      <span style="flex:1"></span>
+      ${isStaff() ? `<button class="btn ghost sm" data-link="${r.id}" title="Lier à un webinaire" aria-label="Lier à un webinaire">🔗</button>` : ''}
+      ${mine ? `<button class="btn ghost sm" data-delete="${r.id}" title="Supprimer" aria-label="Supprimer">🗑</button>` : ''}
+    </div>
+  </article>`;
+}
+
+// Ligne de la bibliothèque en affichage « liste ».
+function resourceListRow(r) {
+  const t = fileType(r);
+  const mine = r.owner_id === profile.id || profile.role === 'admin';
+  const links = (r.links || []).filter(l => l.webinar);
+  return `<div class="list-item">
+    <div class="ftype ${t}">${FILE_TYPES[t][0]}</div>
+    <div class="grow"><strong>${esc(r.title)}</strong>
+      <div class="muted small">${FILE_TYPES[t][1]} · ${esc(fmtSize(r.size_bytes))} · ${esc(fmtShortDate(r.created_at))}${
+        links.length ? ` · 🎥 ${links.map(l => esc(l.webinar.title)).join(', ')}` : ''}</div></div>
+    <div class="row" style="justify-content:flex-end">
+      ${resourceButtons(r)}
+      ${isStaff() ? `<button class="btn ghost sm" data-link="${r.id}" title="Lier à un webinaire">🔗</button>` : ''}
+      ${mine ? `<button class="btn ghost sm" data-delete="${r.id}" title="Supprimer">🗑</button>` : ''}
+    </div>
   </div>`;
 }
 
@@ -2813,7 +2907,7 @@ async function linkWebinarsDialog(r, onDone) {
 }
 
 // Depuis un webinaire : associer des ressources déjà présentes dans la bibliothèque.
-async function linkResourcesDialog(w, linkedIds) {
+async function linkResourcesDialog(w, linkedIds, onChange = () => route()) {
   const { data: resources, error } = await sb.from('resources').select('*').order('created_at', { ascending: false });
   if (error) return fail(error);
   const linked = new Set(linkedIds);
@@ -2823,7 +2917,7 @@ async function linkResourcesDialog(w, linkedIds) {
     <input type="search" id="res-search" placeholder="Rechercher dans la bibliothèque…" style="margin:0">
     <div class="list" id="res-list" style="max-height:380px;overflow-y:auto"></div>
     <div class="actions"><button class="btn primary" data-close>Terminé</button></div>`);
-  onModalClose = () => { if (changed) route(); };
+  onModalClose = () => { if (changed) onChange(); };
 
   const draw = (search = '') => {
     const list = resources.filter(r => !search || `${r.title} ${r.file_name}`.toLowerCase().includes(search));
@@ -2851,23 +2945,42 @@ async function linkResourcesDialog(w, linkedIds) {
 }
 
 function bindResourceButtons(container) {
+  const meta = b => ({ file_path: b.dataset.path, file_name: b.dataset.name, title: b.dataset.title });
   container.querySelectorAll('[data-open]').forEach(b => b.addEventListener('click', () =>
-    openResource({ file_path: b.dataset.path, file_name: b.dataset.name }, b.dataset.type)));
+    openResource(meta(b), b.dataset.type, 'view')));
+  container.querySelectorAll('[data-download]').forEach(b => b.addEventListener('click', () =>
+    openResource(meta(b), b.dataset.type, 'download')));
 }
 
-async function openResource(r, type) {
+// « Voir » : PDF et images dans un nouvel onglet, vidéos dans le lecteur intégré.
+// « Télécharger » : enregistre le fichier sur l'appareil, avec son nom d'origine.
+async function openResource(r, type, mode = 'view') {
+  if (mode === 'download' || !VIEWABLE.has(type)) {
+    const { data, error } = await sb.storage.from('bibliotheque')
+      .createSignedUrl(r.file_path, 600, { download: r.file_name });
+    if (error) return fail(error);
+    const a = document.createElement('a');
+    a.href = data.signedUrl;
+    a.download = r.file_name;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    return toast(`Téléchargement de « ${r.title || r.file_name} »…`);
+  }
   // Fenêtre ouverte tout de suite pour ne pas être bloquée par le navigateur.
   const win = type === 'video' ? null : window.open('', '_blank');
-  const { data, error } = await sb.storage.from('bibliotheque')
-    .createSignedUrl(r.file_path, 3600, type === 'pdf' || type === 'image' ? undefined : { download: r.file_name });
+  const { data, error } = await sb.storage.from('bibliotheque').createSignedUrl(r.file_path, 3600);
   if (error) {
     if (win) win.close();
     return fail(error);
   }
   if (type === 'video') {
-    openModal(`<h2>${esc(r.title || r.file_name)}</h2>
-      <video controls autoplay src="${esc(data.signedUrl)}"></video>
-      <div class="actions"><button class="btn" data-close>Fermer</button></div>`, { wide: true });
+    openModal(`<div class="row spread"><h2 style="margin:0">${esc(r.title || r.file_name)}</h2>
+        <button class="btn ghost" data-close aria-label="Fermer">✕</button></div>
+      <video controls autoplay playsinline src="${esc(data.signedUrl)}"></video>
+      <div class="actions"><button class="btn" id="video-download">⬇ Télécharger</button>
+        <button class="btn primary" data-close>Fermer</button></div>`, { wide: true });
+    modal.querySelector('#video-download').addEventListener('click', () => openResource(r, type, 'download'));
   } else if (win) {
     win.location = data.signedUrl;
   } else {
@@ -2884,54 +2997,85 @@ async function viewLibrary(view, token) {
   if (isStale(token)) return;
   if (error) return (view.innerHTML = `<div class="notice danger">${esc(translateError(error))}</div>`);
 
+  const learner = profile.role === 'apprenant';
   let filter = 'tous';
   let search = '';
+  let sort = 'recent';
+  let layout = 'grid';
+  try { layout = localStorage.getItem('webinaire.libLayout') || 'grid'; } catch (e) { /* stockage indisponible */ }
 
   view.innerHTML = `
     <div class="page-head">
       <div>
         <h1>Bibliothèque</h1>
-        <p class="muted">Ressources didactiques déposées par les encadreurs : PDF, vidéos, présentations, documents.</p>
+        <p class="muted">${learner
+          ? 'Les supports des webinaires auxquels vous êtes inscrit : à consulter en ligne ou à télécharger.'
+          : 'Ressources didactiques : PDF, vidéos, présentations, documents.'}</p>
       </div>
       ${isStaff() ? '<button class="btn primary" id="upload">＋ Déposer une ressource</button>' : ''}
     </div>
     <div class="toolbar">
-      <div class="chips" id="filters">
-        <button class="chip active" data-filter="tous">Tout</button>
-        ${Object.entries(FILE_TYPES).map(([k, [ico, l]]) => `<button class="chip" data-filter="${k}">${ico} ${l}</button>`).join('')}
+      <div class="chips" id="filters"></div>
+      <div class="row">
+        <input class="search" id="search" type="search" placeholder="Rechercher une ressource…">
+        <select id="sort" style="width:auto;margin:0" aria-label="Trier">
+          <option value="recent">Plus récents</option>
+          <option value="title">De A à Z</option>
+          <option value="type">Par type</option>
+        </select>
+        <div class="seg" role="group" aria-label="Affichage">
+          <button class="btn sm" data-layout="grid" title="Vignettes">▦</button>
+          <button class="btn sm" data-layout="list" title="Liste">☰</button>
+        </div>
       </div>
-      <input class="search" id="search" type="search" placeholder="Rechercher une ressource…">
     </div>
     <div id="results"></div>`;
 
+  const matches = r => !search ||
+    `${r.title} ${r.description} ${r.file_name} ${r.owner?.full_name}`.toLowerCase().includes(search);
+  const sorters = {
+    recent: (a, b) => b.created_at.localeCompare(a.created_at),
+    title: (a, b) => a.title.localeCompare(b.title, 'fr', { numeric: true }),
+    type: (a, b) => fileType(a).localeCompare(fileType(b)) || a.title.localeCompare(b.title, 'fr', { numeric: true })
+  };
+  const renderList = list => layout === 'list'
+    ? `<div class="card list">${list.map(resourceListRow).join('')}</div>`
+    : `<div class="rgrid">${list.map(resourceCard).join('')}</div>`;
+
   const draw = () => {
-    const list = resources.filter(r =>
-      (filter === 'tous' || fileType(r) === filter) &&
-      (!search || `${r.title} ${r.description} ${r.file_name} ${r.owner?.full_name}`.toLowerCase().includes(search)));
+    const searched = resources.filter(matches);
+    view.querySelector('#filters').innerHTML = [['tous', '', 'Tout'], ...Object.entries(FILE_TYPES).map(([k, [ico, l]]) => [k, ico, l])]
+      .map(([k, ico, l]) => {
+        const n = k === 'tous' ? searched.length : searched.filter(r => fileType(r) === k).length;
+        return n || k === 'tous' || k === filter
+          ? `<button class="chip ${k === filter ? 'active' : ''}" data-filter="${k}">${ico} ${l} (${n})</button>` : '';
+      }).join('');
+    view.querySelectorAll('[data-layout]').forEach(b => b.classList.toggle('active', b.dataset.layout === layout));
+
+    const list = searched.filter(r => filter === 'tous' || fileType(r) === filter).sort(sorters[sort]);
     const results = document.getElementById('results');
-    results.innerHTML = list.length ? `<div class="grid">${list.map(r => {
-      const t = fileType(r);
-      const mine = r.owner_id === profile.id || profile.role === 'admin';
-      const links = (r.links || []).filter(l => l.webinar);
-      return `<article class="card rcard">
-        <div class="row" style="flex-wrap:nowrap">
-          <div class="ftype ${t}">${FILE_TYPES[t][0]}</div>
-          <div style="min-width:0"><h3>${esc(r.title)}</h3>
-            <div class="muted small">${FILE_TYPES[t][1]} · ${esc(fmtSize(r.size_bytes))} · ${esc(fmtShortDate(r.created_at))}</div></div>
-        </div>
-        ${r.description ? `<p class="muted small clamp">${esc(r.description)}</p>` : ''}
-        <div class="muted small">🧑‍🏫 ${esc(r.owner?.full_name)}</div>
-        ${links.length ? `<div class="row">${links.map(l =>
-          `<a class="badge" href="#/webinaires/${l.webinar.id}">🎥 ${esc(l.webinar.title)}</a>`).join('')}</div>` : ''}
-        <div class="row" style="margin-top:auto">
-          <button class="btn primary sm" data-open="${r.id}" data-path="${esc(r.file_path)}" data-name="${esc(r.file_name)}"
-            data-type="${t}">${t === 'video' ? '▶ Regarder' : t === 'pdf' || t === 'image' ? 'Ouvrir' : '⬇ Télécharger'}</button>
-          ${isStaff() ? `<button class="btn sm" data-link="${r.id}">🔗 Lier à un webinaire</button>` : ''}
-          ${mine ? `<button class="btn ghost sm" data-delete="${r.id}">Supprimer</button>` : ''}
-        </div>
-      </article>`;
-    }).join('')}</div>` : `<div class="card">${emptyState('📚', resources.length ?
-      'Aucune ressource ne correspond.' : 'La bibliothèque est vide pour le moment.')}</div>`;
+    if (!list.length) {
+      results.innerHTML = `<div class="card">${emptyState('📚', resources.length ? 'Aucune ressource ne correspond.'
+        : learner ? 'Aucune ressource pour le moment. Les supports apparaissent ici dès que vous êtes inscrit à un webinaire qui en propose.'
+        : 'La bibliothèque est vide pour le moment.')}</div>`;
+    } else if (learner) {
+      // Apprenant : ressources regroupées par webinaire.
+      const groups = new Map();
+      list.forEach(r => (r.links || []).filter(l => l.webinar).forEach(l => {
+        if (!groups.has(l.webinar.id)) groups.set(l.webinar.id, { title: l.webinar.title, items: [] });
+        groups.get(l.webinar.id).items.push(r);
+      }));
+      results.innerHTML = [...groups.entries()].map(([id, g]) => `
+        <section style="margin-bottom:24px">
+          <div class="row spread" style="margin-bottom:12px">
+            <h2 style="margin:0">🎥 ${esc(g.title)}</h2>
+            <a class="small" href="#/webinaires/${id}">Voir le webinaire →</a>
+          </div>
+          ${renderList(g.items)}
+        </section>`).join('');
+    } else {
+      results.innerHTML = renderList(list);
+    }
     bindResourceButtons(results);
     results.querySelectorAll('[data-link]').forEach(b => b.addEventListener('click', () =>
       linkWebinarsDialog(resources.find(x => x.id === b.dataset.link), draw)));
@@ -2957,6 +3101,12 @@ async function viewLibrary(view, token) {
     draw();
   });
   view.querySelector('#search').addEventListener('input', e => { search = e.target.value.trim().toLowerCase(); draw(); });
+  view.querySelector('#sort').addEventListener('change', e => { sort = e.target.value; draw(); });
+  view.querySelectorAll('[data-layout]').forEach(b => b.addEventListener('click', () => {
+    layout = b.dataset.layout;
+    try { localStorage.setItem('webinaire.libLayout', layout); } catch (e) { /* stockage indisponible */ }
+    draw();
+  }));
   const up = view.querySelector('#upload');
   if (up) up.addEventListener('click', () => uploadDialog(created => { resources.unshift(created); draw(); }));
 }
