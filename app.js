@@ -1648,15 +1648,27 @@ async function startVideo() {
     renderRoomView();
     return;
   }
+  // Daily n'accepte qu'une visio à la fois : on attend la fermeture complète de la
+  // précédente (sinon un retour dans la salle restait bloqué sur « Connexion… »).
+  if (dailyClosing) await dailyClosing;
+  const leftover = window.Daily.getCallInstance && window.Daily.getCallInstance();
+  if (leftover) {
+    try { await leftover.destroy(); } catch (e) { /* déjà détruite */ }
+  }
   const box = document.getElementById('video-stage');
   if (room.id !== id || !box) { room.video = null; return; }
   box.innerHTML = '';
-  room.call = window.Daily.createFrame(box, {
-    iframeStyle: { width: '100%', height: '100%', border: '0' },
-    showLeaveButton: false,
-    showFullscreenButton: true,
-    lang: 'fr'
-  });
+  try {
+    room.call = window.Daily.createFrame(box, {
+      iframeStyle: { width: '100%', height: '100%', border: '0' },
+      showLeaveButton: false,
+      showFullscreenButton: true,
+      lang: 'fr'
+    });
+  } catch (err) {
+    room.video = null;
+    return videoFailed(id, err?.message);
+  }
   room.video = 'on';
   room.call.on('error', e => videoFailed(id, e?.errorMsg || e?.error?.type));
   try {
@@ -1679,9 +1691,16 @@ function videoFailed(id, code) {
   renderRoomView();
 }
 
+// Fermeture en cours de la visio précédente (la destruction Daily est asynchrone).
+let dailyClosing = null;
+
 function stopVideo() {
   if (room.call) {
-    try { room.call.destroy(); } catch (e) { /* déjà détruite */ }
+    const call = room.call;
+    dailyClosing = Promise.resolve()
+      .then(() => call.destroy())
+      .catch(() => { /* déjà détruite */ })
+      .finally(() => { dailyClosing = null; });
   }
   room.call = null;
   if (room.video !== 'off') room.video = null;
@@ -2011,6 +2030,9 @@ async function viewRoom(view, token, id) {
   if (isHost) {
     await onAdmitted();
     await loadLobby();
+  } else if (room.lobby === 'admis') {
+    // Déjà admis pendant ce cours (retour après un départ ou un rechargement) : entrée directe.
+    await onAdmitted();
   } else {
     renderRoomView();
   }
@@ -2041,7 +2063,8 @@ function stopAttendance() {
 
 async function leaveRoom() {
   if (!room.id) return;
-  // En quittant, on sort de la salle d'attente : pour revenir, il faudra être admis à nouveau.
+  clearInterval(room.clock);
+  // Un participant admis qui quitte pourra revenir directement ; s'il attendait encore, sa demande est retirée.
   if (!room.isHost) sb.rpc('lobby_leave', { w: room.id });
   stopAttendance();
   stopVideo();
@@ -2093,15 +2116,50 @@ function onlineList() {
 
 function participantsLabel() {
   const hands = onlineList().filter(p => p.hand).length;
+  if (!room.isHost) return `👥 ${onlineList().length}`;
   return `👥 ${onlineList().length}${hands ? ` · ✋ ${hands}` : ''}${room.lobbyList.length ? ` · 🔔 ${room.lobbyList.length}` : ''}`;
+}
+
+function teacherOnline() {
+  return onlineList().some(p => p.user_id === room.webinar?.encadreur_id);
 }
 
 function renderRoomMeta() {
   const hands = onlineList().filter(p => p.hand).length;
+  const w = room.webinar;
   const el = document.getElementById('online-count');
-  if (el) el.textContent = `👥 ${onlineList().length} en ligne${hands ? ` · ✋ ${hands} main${hands > 1 ? 's' : ''} levée${hands > 1 ? 's' : ''}` : ''}`;
+  if (el) {
+    el.textContent = `👥 ${onlineList().length} en ligne${hands ? ` · ✋ ${hands} main${hands > 1 ? 's' : ''} levée${hands > 1 ? 's' : ''}` : ''}`;
+  }
+  const teacher = document.getElementById('teacher-status');
+  if (teacher && w) {
+    teacher.innerHTML = teacherOnline()
+      ? `<span class="badge ok">🧑‍🏫 ${esc(w.encadreur?.full_name || 'L’encadreur')} est en salle</span>`
+      : `<span class="badge warn">🧑‍🏫 ${esc(w.encadreur?.full_name || 'L’encadreur')} n’est pas en salle</span>`;
+  }
   const tabBtn = document.querySelector('[data-rtab="participants"]');
   if (tabBtn) tabBtn.textContent = participantsLabel();
+}
+
+// Heure de début du direct et temps écoulé, mis à jour chaque seconde.
+function startClock() {
+  clearInterval(room.clock);
+  const tick = () => {
+    const el = document.getElementById('live-clock');
+    const w = room.webinar;
+    if (!el || !w) return;
+    if (w.status === 'en_direct') {
+      const start = w.live_started_at || room.liveSeenAt || (room.liveSeenAt = new Date().toISOString());
+      const s = Math.max(0, Math.floor((Date.now() - new Date(start).getTime()) / 1000));
+      el.textContent = `▶ Début du cours : ${fmtTime(start)} · ⏱ ${pad(Math.floor(s / 3600))}:${pad(Math.floor(s / 60) % 60)}:${pad(s % 60)}`;
+    } else if (w.status === 'planifie') {
+      el.textContent = `Début prévu à ${fmtTime(w.starts_at)}`;
+    } else {
+      el.textContent = '';
+    }
+  };
+  tick();
+  room.clock = setInterval(tick, 1000);
 }
 
 function renderRoomView() {
@@ -2146,13 +2204,14 @@ function renderRoomView() {
   }
 
   const tabs = [['chat', '💬 Chat'], ['questions', '❓ Questions'], ['sondages', '📊 Sondages']];
-  if (host) tabs.push(['participants', participantsLabel()]);
+  tabs.push(['participants', participantsLabel()]);
 
   view.innerHTML = `
     <div class="page-head">
       <div>
         <a class="back" href="#/webinaires/${w.id}">← Quitter la salle</a>
         <div class="row" style="margin-bottom:6px">${statusBadge(w)}<span class="muted small" id="online-count"></span></div>
+        <div class="row" style="margin-bottom:6px"><span id="teacher-status"></span><strong class="small" id="live-clock"></strong></div>
         <h1>${esc(w.title)}</h1>
       </div>
     </div>
@@ -2186,6 +2245,7 @@ function renderRoomView() {
   renderHandBar();
   renderLobbyBar();
   renderPanel();
+  startClock();
 }
 
 // Agrandir la vidéo (masque le panneau latéral) ou la passer en plein écran.
@@ -2299,6 +2359,23 @@ function renderPanel() {
     const people = onlineList().sort((a, b) =>
       (b.hand ? 1 : 0) - (a.hand ? 1 : 0) || (a.hand_at || '').localeCompare(b.hand_at || ''));
     const hands = people.filter(p => p.hand).length;
+    const host = room.isHost;
+    if (!host) {
+      // Apprenant : liste en lecture seule, l'encadreur en tête.
+      const sorted = people.sort((a, b) => (b.user_id === w.encadreur_id ? 1 : 0) - (a.user_id === w.encadreur_id ? 1 : 0));
+      panel.innerHTML = `<div class="messages">
+        <div class="muted small">En ligne : ${people.length}</div>
+        <div class="list">${sorted.map(p => `
+          <div class="list-item">
+            <div class="avatar sm">${esc(initials(p.name))}</div>
+            <div class="grow"><div>${p.hand ? '✋ ' : ''}${esc(p.name)}${p.user_id === profile.id ? ' (vous)' : ''}</div>
+              <div class="muted small">${p.user_id === w.encadreur_id ? '🧑‍🏫 Encadreur · organisateur' : ROLE_LABELS[p.role] || ''}
+                · depuis ${esc(fmtTime(p.joined_at))}</div></div>
+          </div>`).join('')}</div>
+        ${teacherOnline() ? '' : '<div class="notice warn">L’encadreur n’est pas encore (ou plus) dans la salle.</div>'}
+      </div>`;
+      return;
+    }
     panel.innerHTML = `<div class="messages">
       ${room.lobbyList.length ? `<div class="notice warn">🔔 ${room.lobbyList.length} personne${room.lobbyList.length > 1 ? 's' : ''}
         dans la salle d’attente : admettez-les dans le bandeau au-dessus de la vidéo.</div>` : ''}
