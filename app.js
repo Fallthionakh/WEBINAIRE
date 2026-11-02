@@ -2543,7 +2543,11 @@ function onWebinarUpdate(next) {
 }
 
 function onlineList() {
-  return Object.values(room.presence).map(list => list[0]).filter(Boolean)
+  // Une personne connectée deux fois (deux onglets, reconnexion) a plusieurs états :
+  // on garde celui qui montre un document, sinon le plus récent.
+  const pick = list => (list || []).filter(m => m && m.share && m.share.url)
+    .sort((a, b) => (b.share.at || '').localeCompare(a.share.at || ''))[0] || (list || [])[list.length - 1];
+  return Object.values(room.presence).map(pick).filter(Boolean)
     .sort((a, b) => (a.name || '').localeCompare(b.name || '', 'fr'));
 }
 
