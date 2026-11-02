@@ -1607,6 +1607,8 @@ function emptyRoom() {
     myShare: null,     // document que je montre à la salle : { url, kind, name, page, count, at, path }
     shareBusy: false,  // envoi du document en cours
     sharesSeen: new Set(),
+    remoteShares: new Map(), // projections des autres : user_id → { name, share, seen }
+    shareTimer: null,
     projectionHidden: null // projection masquée par moi (valeur « at » de la projection)
   };
 }
@@ -1923,7 +1925,7 @@ async function startMyShare(file) {
       page: 1, count: 1, at: new Date().toISOString(), path
     };
     room.projectionHidden = null;
-    trackMe();
+    broadcastShare();
     renderProjection();
     if (previous?.path) sb.storage.from('salle').remove([previous.path]);
     toast('Votre document est affiché pour toute la salle.', 'success');
@@ -1939,22 +1941,61 @@ function stopMyShare(message) {
   const share = room.myShare;
   if (!share) return;
   room.myShare = null;
-  trackMe();
+  broadcastShare(null);
   renderProjection();
   renderHandBar();
   if (share.path) sb.storage.from('salle').remove([share.path]);
   if (message) toast(message);
 }
 
+// La projection est annoncée par « broadcast » (temps réel, sans limite pratique),
+// pas par la présence (Supabase n'accepte que 5 mises à jour de présence par 30 s).
+// Elle est répétée toutes les 8 s : les retardataires la reçoivent, et une
+// projection qui n'est plus répétée depuis 25 s disparaît d'elle-même.
+const SHARE_REPEAT_MS = 8000;
+const SHARE_EXPIRE_MS = 25000;
+
+function broadcastShare(value = room.myShare) {
+  if (!room.channel) return;
+  const share = value ? { url: value.url, kind: value.kind, name: value.name, page: value.page, count: value.count, at: value.at } : null;
+  room.channel.send({ type: 'broadcast', event: 'share', payload: { user_id: profile.id, name: profile.full_name, share } });
+}
+
+function onRemoteShare({ user_id, name, share }) {
+  if (!user_id || user_id === profile.id) return;
+  if (!share) {
+    room.remoteShares.delete(user_id);
+  } else {
+    if (!room.sharesSeen.has(share.at)) {
+      room.sharesSeen.add(share.at);
+      toast(`📱 ${name} montre un document`);
+    }
+    room.remoteShares.set(user_id, { name, share, seen: Date.now() });
+  }
+  renderProjection();
+  if (room.background) updateDock();
+}
+
+// Horloge de la projection : répète la mienne, oublie celles qui ne sont plus annoncées.
+function startShareSync() {
+  clearInterval(room.shareTimer);
+  room.shareTimer = setInterval(() => {
+    if (room.myShare) broadcastShare();
+    let changed = false;
+    room.remoteShares.forEach((v, uid) => {
+      if (Date.now() - v.seen > SHARE_EXPIRE_MS) { room.remoteShares.delete(uid); changed = true; }
+    });
+    if (changed) { renderProjection(); if (room.background) updateDock(); }
+  }, SHARE_REPEAT_MS);
+  // Projections déjà en cours à mon arrivée.
+  if (room.channel) room.channel.send({ type: 'broadcast', event: 'share-request', payload: {} });
+}
+
 // Projection affichée : la plus récente parmi les personnes présentes.
 function currentProjection() {
   if (!room.id) return null;
-  const list = onlineList()
-    .map(p => (p.user_id === profile.id ? { ...p, share: room.myShare } : p))
-    .filter(p => p.share && p.share.url);
-  if (room.myShare && !list.some(p => p.user_id === profile.id)) {
-    list.push({ user_id: profile.id, name: profile.full_name, share: room.myShare });
-  }
+  const list = [...room.remoteShares.entries()].map(([user_id, v]) => ({ user_id, name: v.name, share: v.share }));
+  if (room.myShare) list.push({ user_id: profile.id, name: profile.full_name, share: room.myShare });
   list.sort((a, b) => (b.share.at || '').localeCompare(a.share.at || ''));
   return list[0] || null;
 }
@@ -2024,7 +2065,7 @@ function projectionAction(action, p) {
     const page = Math.min(room.myShare.count, Math.max(1, room.myShare.page + (action === 'next' ? 1 : -1)));
     if (page === room.myShare.page) return;
     room.myShare.page = page;
-    trackMe();
+    broadcastShare();
     return renderProjection();
   }
   if (action === 'stop') {
@@ -2047,7 +2088,7 @@ async function renderProjectionPdf(layer, s, mine) {
     const doc = projDoc.doc;
     if (mine && room.myShare && room.myShare.url === s.url && room.myShare.count !== doc.numPages) {
       room.myShare.count = doc.numPages; // nombre de pages connu une fois le PDF ouvert
-      trackMe();
+      broadcastShare();
       return renderProjection();
     }
     const page = await doc.getPage(Math.min(s.page, doc.numPages));
@@ -2124,11 +2165,9 @@ function renderSupports() {
 function trackMe() {
   // Seules les personnes admises apparaissent dans la liste des participants.
   if (!room.channel || (!room.isHost && room.lobby !== 'admis')) return;
-  const sh = room.myShare;
   room.channel.track({
     user_id: profile.id, name: profile.full_name, role: profile.role,
-    joined_at: room.joinedAt, hand: room.hand, hand_at: room.handAt,
-    share: sh ? { url: sh.url, kind: sh.kind, name: sh.name, page: sh.page, count: sh.count, at: sh.at } : null
+    joined_at: room.joinedAt, hand: room.hand, hand_at: room.handAt
   });
 }
 
@@ -2306,6 +2345,7 @@ async function onAdmitted() {
   if (room.id !== id) return;
   room.joinedAt = new Date().toISOString();
   trackMe();
+  startShareSync();
   renderRoomView();
   loadSupports();
   if (room.webinar.status === 'en_direct') {
@@ -2383,10 +2423,6 @@ async function viewRoom(view, token, id) {
         hands.filter(p => !room.handsSeen.has(p.user_id)).forEach(p => toast(`✋ ${p.name} lève la main`));
       }
       room.handsSeen = new Set(hands.map(p => p.user_id));
-      // Nouvelle projection (capture, photo, PDF) montrée par un participant.
-      const shares = onlineList().filter(p => p.share && p.user_id !== profile.id);
-      shares.filter(p => !room.sharesSeen.has(p.share.at)).forEach(p => toast(`📱 ${p.name} montre un document`));
-      room.sharesSeen = new Set(shares.map(p => p.share.at));
       renderRoomMeta();
       renderProjection();
       if (room.background) updateDock();
@@ -2395,6 +2431,8 @@ async function viewRoom(view, token, id) {
     .on('broadcast', { event: 'stop-share' }, ({ payload }) => {
       if (payload.user_id === profile.id) stopMyShare('L’encadreur a fermé votre projection.');
     })
+    .on('broadcast', { event: 'share' }, ({ payload }) => onRemoteShare(payload))
+    .on('broadcast', { event: 'share-request' }, () => { if (room.myShare) broadcastShare(); })
     .on('broadcast', { event: 'lower-hand' }, ({ payload }) => {
       if (payload.user_id === profile.id && room.hand) {
         setHand(false);
@@ -2487,6 +2525,8 @@ function stopAttendance() {
 
 async function leaveRoom() {
   if (!room.id) return;
+  clearInterval(room.shareTimer);
+  if (room.myShare) broadcastShare(null);
   if (room.myShare?.path) sb.storage.from('salle').remove([room.myShare.path]);
   document.getElementById('projection')?.remove();
   clearInterval(room.clock);
@@ -2543,11 +2583,8 @@ function onWebinarUpdate(next) {
 }
 
 function onlineList() {
-  // Une personne connectée deux fois (deux onglets, reconnexion) a plusieurs états :
-  // on garde celui qui montre un document, sinon le plus récent.
-  const pick = list => (list || []).filter(m => m && m.share && m.share.url)
-    .sort((a, b) => (b.share.at || '').localeCompare(a.share.at || ''))[0] || (list || [])[list.length - 1];
-  return Object.values(room.presence).map(pick).filter(Boolean)
+  // Une personne connectée deux fois (deux onglets, reconnexion) a plusieurs états : on garde le plus récent.
+  return Object.values(room.presence).map(list => list[list.length - 1]).filter(Boolean)
     .sort((a, b) => (a.name || '').localeCompare(b.name || '', 'fr'));
 }
 
