@@ -750,3 +750,29 @@ tr:last-child td { border-bottom: 0; }
 .share-status { flex-basis: 100%; color: var(--muted); }
 .share-status.ok { color: #059669; font-weight: 600; }
 .share-status.warn { color: #b45309; font-weight: 600; }
+
+/* ---------- Lecteur de document intégré (la visio passe en miniature) ---------- */
+.doc-viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 21; /* sous la mini-fenêtre de la visio (22) */
+  display: flex;
+  flex-direction: column;
+  background: #0b0e17;
+  color: #fff;
+}
+.doc-viewer-bar { display: flex; align-items: center; gap: 8px; padding: 10px 12px; background: rgba(255, 255, 255, .06); }
+.doc-viewer-bar .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.doc-viewer-body { flex: 1; overflow: auto; -webkit-overflow-scrolling: touch; padding: 8px 8px 260px; text-align: center; }
+.doc-viewer-body canvas, .doc-viewer-body img { display: block; margin: 0 auto; max-width: 100%; height: auto; background: #fff; }
+.doc-viewer-page { margin: 6px 0 14px; font-size: .8rem; opacity: .6; }
+body.doc-viewer-open { overflow: hidden; }
+.choice-list { display: grid; gap: 10px; margin-top: 16px; }
+.choice-list .btn { width: 100%; white-space: normal; flex-direction: column; gap: 2px; padding-top: 12px; padding-bottom: 12px; }
+.choice-list .btn small { font-weight: 400; opacity: .75; }
+@media (max-width: 600px) {
+  .call-dock.mini { width: min(220px, calc(100vw - 16px)); }
+  .call-dock.mini .call-dock-bar { padding: 6px 8px; font-size: .8rem; }
+  .call-dock.mini .call-dock-actions { padding: 6px 8px; gap: 6px; }
+  .call-dock.mini .call-dock-actions .btn { padding: 6px 4px; font-size: .75rem; }
+}
