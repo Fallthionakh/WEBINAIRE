@@ -706,3 +706,25 @@ tr:last-child td { border-bottom: 0; }
 .projection-body { flex: 1; min-height: 0; display: grid; place-items: center; padding: 8px; overflow: hidden; }
 .projection-body img, .projection-body canvas { max-width: 100%; max-height: 100%; object-fit: contain; }
 .call-dock .projection { border-radius: inherit; }
+
+/* ---------- Mise à jour du site et accusé de réception de la projection ---------- */
+.update-banner {
+  position: fixed;
+  z-index: 90;
+  left: 50%;
+  top: 12px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: calc(100vw - 24px);
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  box-shadow: 0 12px 40px rgba(17, 24, 39, .25);
+}
+.share-status { flex-basis: 100%; color: var(--muted); }
+.share-status.ok { color: #059669; font-weight: 600; }
+.share-status.warn { color: #b45309; font-weight: 600; }

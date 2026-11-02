@@ -3,6 +3,9 @@
 // temps réel et stockage des fichiers. Les droits de chaque rôle sont
 // appliqués par la base (voir supabase/schema.sql), pas seulement ici.
 
+// Version du site : à changer à chaque mise à jour, ici, dans version.json et dans index.html.
+const APP_VERSION = '2026-11-02-4';
+
 const CONFIG = window.WEBINAIRE_CONFIG || {};
 const configured = Boolean(CONFIG.supabaseUrl && CONFIG.supabaseKey && window.supabase);
 const sb = configured ? window.supabase.createClient(CONFIG.supabaseUrl, CONFIG.supabaseKey) : null;
@@ -365,6 +368,7 @@ function renderShell(hash) {
           <div class="who">
             <div class="name">${esc(profile.full_name || profile.email)}</div>
             <div class="muted small">${ROLE_LABELS[profile.role]}</div>
+            <div class="muted" style="font-size:.7rem">Version ${APP_VERSION}</div>
           </div>
           <button class="btn ghost sm" id="logout" title="Déconnexion" aria-label="Déconnexion">⎋</button>
         </div>
@@ -1608,6 +1612,7 @@ function emptyRoom() {
     shareBusy: false,  // envoi du document en cours
     sharesSeen: new Set(),
     remoteShares: new Map(), // projections des autres : user_id → { name, share, seen }
+    shareSeenBy: new Set(),   // participants qui ont confirmé recevoir ma projection
     shareTimer: null,
     projectionHidden: null // projection masquée par moi (valeur « at » de la projection)
   };
@@ -1925,6 +1930,7 @@ async function startMyShare(file) {
       page: 1, count: 1, at: new Date().toISOString(), path
     };
     room.projectionHidden = null;
+    room.shareSeenBy = new Set();
     broadcastShare();
     renderProjection();
     if (previous?.path) sb.storage.from('salle').remove([previous.path]);
@@ -1955,6 +1961,20 @@ function stopMyShare(message) {
 const SHARE_REPEAT_MS = 8000;
 const SHARE_EXPIRE_MS = 25000;
 
+// Ce que voit l'auteur d'une projection : combien de participants la reçoivent.
+function renderShareStatus() {
+  const el = document.getElementById('share-status');
+  if (!el || !room.myShare) return;
+  const n = room.shareSeenBy.size;
+  const waited = Date.now() - new Date(room.myShare.at).getTime();
+  el.className = `share-status small ${n ? 'ok' : waited > 12000 ? 'warn' : ''}`;
+  el.textContent = n
+    ? `👁 Vu par ${n} participant${n > 1 ? 's' : ''}`
+    : waited > 12000
+      ? '⚠️ Aucun participant ne reçoit encore votre document. Demandez-leur de recharger la page.'
+      : '⏳ Envoi aux participants…';
+}
+
 function broadcastShare(value = room.myShare) {
   if (!room.channel) return;
   const share = value ? { url: value.url, kind: value.kind, name: value.name, page: value.page, count: value.count, at: value.at } : null;
@@ -1969,6 +1989,8 @@ function onRemoteShare({ user_id, name, share }) {
     if (!room.sharesSeen.has(share.at)) {
       room.sharesSeen.add(share.at);
       toast(`📱 ${name} montre un document`);
+      // Accusé de réception : l'auteur voit combien de participants reçoivent son document.
+      room.channel?.send({ type: 'broadcast', event: 'share-seen', payload: { to: user_id, from: profile.id, at: share.at } });
     }
     room.remoteShares.set(user_id, { name, share, seen: Date.now() });
   }
@@ -1980,7 +2002,7 @@ function onRemoteShare({ user_id, name, share }) {
 function startShareSync() {
   clearInterval(room.shareTimer);
   room.shareTimer = setInterval(() => {
-    if (room.myShare) broadcastShare();
+    if (room.myShare) { broadcastShare(); renderShareStatus(); }
     let changed = false;
     room.remoteShares.forEach((v, uid) => {
       if (Date.now() - v.seen > SHARE_EXPIRE_MS) { room.remoteShares.delete(uid); changed = true; }
@@ -2189,10 +2211,13 @@ function renderHandBar() {
     ? '<button class="btn active" id="doc-stop">⏹ Arrêter de montrer</button><button class="btn" id="doc-pick">🔄 Changer</button>'
     : `<button class="btn" id="doc-pick"${room.shareBusy ? ' disabled' : ''}>${room.shareBusy ? '⏳ Envoi…'
       : screenOk ? '📎 Montrer un document' : '📱 Montrer une capture ou un document'}</button>`);
+  const status = room.myShare ? '<div class="share-status small" id="share-status"></div>' : '';
   bar.innerHTML = room.hand
     ? `<div class="notice warn row spread" style="flex-basis:100%"><span>✋ <strong>Vous avez levé la main.</strong> L’encadreur est prévenu et vous donnera la parole.</span>
         <button class="btn sm" id="hand-toggle">Baisser la main</button></div>${share}`
     : `<button class="btn" id="hand-toggle">✋ Lever la main</button>${share}`;
+  bar.insertAdjacentHTML('beforeend', status);
+  renderShareStatus();
   bar.querySelector('#hand-toggle').addEventListener('click', () => setHand(!room.hand));
   const shareBtn = bar.querySelector('#share-toggle');
   if (shareBtn) shareBtn.addEventListener('click', toggleScreenShare);
@@ -2433,6 +2458,11 @@ async function viewRoom(view, token, id) {
     })
     .on('broadcast', { event: 'share' }, ({ payload }) => onRemoteShare(payload))
     .on('broadcast', { event: 'share-request' }, () => { if (room.myShare) broadcastShare(); })
+    .on('broadcast', { event: 'share-seen' }, ({ payload }) => {
+      if (payload.to !== profile.id || !room.myShare || payload.at !== room.myShare.at) return;
+      room.shareSeenBy.add(payload.from);
+      renderShareStatus();
+    })
     .on('broadcast', { event: 'lower-hand' }, ({ payload }) => {
       if (payload.user_id === profile.id && room.hand) {
         setHand(false);
@@ -2709,6 +2739,7 @@ function renderRoomView() {
         <div id="projection-chip"></div>
         ${!host && w.status === 'en_direct' ? '<div class="stage-tools" id="hand-bar"></div>' : ''}
         <div id="supports" style="margin-top:16px"></div>
+        <p class="muted" style="font-size:.75rem;margin-top:12px">Version du site : ${APP_VERSION}</p>
       </section>
       <aside class="card side-panel">
         <div class="tabs">${tabs.map(([k, l]) =>
@@ -4044,6 +4075,52 @@ function viewProfile(view) {
 // =====================================================================
 
 window.addEventListener('hashchange', route);
+
+// =====================================================================
+// Mise à jour automatique. GitHub Pages garde les fichiers en cache environ
+// 10 minutes : un participant pouvait garder l'ancienne version du site.
+// On compare la version chargée à version.json (jamais mis en cache). Si une
+// nouvelle version existe, on recharge la page ; pendant une visio, un bandeau
+// propose la mise à jour au lieu de couper l'appel.
+// =====================================================================
+const RELOADED_KEY = 'webinaire.reloaded-for';
+
+async function checkVersion() {
+  try {
+    const res = await fetch(`version.json?t=${Date.now()}`, { cache: 'no-store' });
+    if (!res.ok) return;
+    const { version } = await res.json();
+    if (!version || version === APP_VERSION) return;
+    // Adresse avec ?v=… : le navigateur ne peut pas resservir l'ancienne page en cache.
+    const url = `${location.pathname}?v=${encodeURIComponent(version)}${location.hash}`;
+    let already = null;
+    try { already = sessionStorage.getItem(RELOADED_KEY); } catch (e) { /* stockage indisponible */ }
+    if (!callActive() && already !== version) {
+      try { sessionStorage.setItem(RELOADED_KEY, version); } catch (e) { /* stockage indisponible */ }
+      location.replace(url);
+      return;
+    }
+    showUpdateBanner(url);
+  } catch (e) { /* hors ligne */ }
+}
+
+function showUpdateBanner(url) {
+  if (document.getElementById('update-banner')) return;
+  const bar = document.createElement('div');
+  bar.id = 'update-banner';
+  bar.className = 'update-banner';
+  bar.innerHTML = '<span>🔄 Une nouvelle version du site est disponible.</span><button class="btn sm primary">Mettre à jour</button>';
+  bar.querySelector('button').addEventListener('click', async () => {
+    if (callActive() && !await confirmDialog('Mettre à jour maintenant ? La visio sera coupée quelques secondes.',
+      { confirmLabel: 'Mettre à jour' })) return;
+    location.replace(url);
+  });
+  document.body.append(bar);
+}
+
+checkVersion();
+setInterval(checkVersion, 60000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) checkVersion(); });
 
 if (configured) {
   sb.auth.onAuthStateChange((event, s) => {

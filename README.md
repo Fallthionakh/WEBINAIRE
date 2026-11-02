@@ -76,3 +76,17 @@ Pour une présentation PowerPoint pendant le direct, exportez-la d'abord en PDF
 - [ ] Rappels par e-mail avant chaque webinaire (SMTP personnalisé)
 - [ ] Enregistrement des replays dans la bibliothèque
 - [ ] Attestations de présence en PDF
+
+## Publier une mise à jour
+
+GitHub Pages garde les fichiers en cache environ 10 minutes. Pour que tout le monde reçoive la nouvelle version,
+changez **le même numéro de version** à trois endroits :
+
+1. `version.json` ;
+2. `index.html` (`styles.css?v=…` et `app.js?v=…`) ;
+3. `APP_VERSION`, en haut de `app.js`.
+
+Le site compare sa version à `version.json` toutes les minutes. S'il trouve une version plus récente, il se recharge tout
+seul ; pendant une visio, il affiche à la place un bandeau « Mettre à jour », pour ne pas couper l'appel. La version
+chargée s'affiche dans le menu et en bas de la salle.
+
