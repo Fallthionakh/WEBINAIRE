@@ -4,7 +4,7 @@
 // appliqués par la base (voir supabase/schema.sql), pas seulement ici.
 
 // Version du site : à changer à chaque mise à jour, ici, dans version.json et dans index.html.
-const APP_VERSION = '2026-11-02-4';
+const APP_VERSION = '2026-11-02-5';
 
 const CONFIG = window.WEBINAIRE_CONFIG || {};
 const configured = Boolean(CONFIG.supabaseUrl && CONFIG.supabaseKey && window.supabase);
@@ -1613,6 +1613,7 @@ function emptyRoom() {
     sharesSeen: new Set(),
     remoteShares: new Map(), // projections des autres : user_id → { name, share, seen }
     shareSeenBy: new Set(),   // participants qui ont confirmé recevoir ma projection
+    projZoom: false,          // projection affichée en pleine largeur (défilement vertical)
     shareTimer: null,
     projectionHidden: null // projection masquée par moi (valeur « at » de la projection)
   };
@@ -2047,7 +2048,7 @@ function renderProjection() {
   }
   const s = p.share;
   const mine = p.user_id === profile.id;
-  const key = `${s.url}|${s.page}|${s.count}|${room.isHost}`;
+  const key = `${s.url}|${s.page}|${s.count}|${room.isHost}|${room.projZoom}`;
   if (layer.dataset.key === key) return;
   layer.dataset.key = key;
   const pages = s.kind === 'pdf' && s.count > 1
@@ -2060,12 +2061,36 @@ function renderProjection() {
     <div class="projection-bar">
       <span class="grow">📱 <strong>${mine ? 'Vous montrez' : `${esc(p.name)} montre`}</strong> · ${esc(s.name)}</span>
       ${pages}
+      <button class="btn sm${room.projZoom ? ' active' : ''}" data-proj="zoom" title="${room.projZoom ? 'Voir la page entière' : 'Agrandir (pleine largeur, défilement)'}">${room.projZoom ? '🔍 Page entière' : '🔍 Zoom'}</button>
       <button class="btn sm" data-proj="hide">${callActive() ? '🎥 Voir la visio' : 'Masquer'}</button>
       ${mine || room.isHost ? `<button class="btn sm danger" data-proj="stop">${mine ? 'Arrêter' : 'Fermer'}</button>` : ''}
     </div>
     <div class="projection-body">${s.kind === 'image' ? `<img src="${esc(s.url)}" alt="${esc(s.name)}">` : '<canvas></canvas>'}</div>`;
+  layer.classList.toggle('zoom', room.projZoom);
   layer.querySelectorAll('[data-proj]').forEach(b => b.addEventListener('click', () => projectionAction(b.dataset.proj, p)));
-  if (s.kind === 'pdf') renderProjectionPdf(layer, s, mine);
+  const body = layer.querySelector('.projection-body');
+  // Auteur d'un PDF : glisser vers la gauche ou la droite pour changer de page.
+  if (mine && s.kind === 'pdf') {
+    let x0 = null, y0 = null;
+    body.addEventListener('touchstart', e => { x0 = e.touches[0].clientX; y0 = e.touches[0].clientY; }, { passive: true });
+    body.addEventListener('touchend', e => {
+      if (x0 === null) return;
+      const dx = e.changedTouches[0].clientX - x0, dy = e.changedTouches[0].clientY - y0;
+      x0 = null;
+      if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) changeSharePage(dx < 0 ? 1 : -1);
+    });
+  }
+  if (s.kind === 'pdf') {
+    renderProjectionPdf(layer, s, mine);
+    // Nouveau rendu net si la taille change (rotation du téléphone, plein écran, « Agrandir »).
+    let lastW = body.clientWidth, timer = null;
+    new ResizeObserver(() => {
+      if (!layer.isConnected || Math.abs(body.clientWidth - lastW) < 8) return;
+      lastW = body.clientWidth;
+      clearTimeout(timer);
+      timer = setTimeout(() => renderProjectionPdf(layer, s, mine), 150);
+    }).observe(body);
+  }
 }
 
 function renderProjectionChip(p) {
@@ -2083,13 +2108,11 @@ function projectionAction(action, p) {
     room.projectionHidden = p.share.at;
     return renderProjection();
   }
-  if ((action === 'prev' || action === 'next') && room.myShare) {
-    const page = Math.min(room.myShare.count, Math.max(1, room.myShare.page + (action === 'next' ? 1 : -1)));
-    if (page === room.myShare.page) return;
-    room.myShare.page = page;
-    broadcastShare();
+  if (action === 'zoom') {
+    room.projZoom = !room.projZoom;
     return renderProjection();
   }
+  if (action === 'prev' || action === 'next') return changeSharePage(action === 'next' ? 1 : -1);
   if (action === 'stop') {
     if (p.user_id === profile.id) return stopMyShare();
     room.channel?.send({ type: 'broadcast', event: 'stop-share', payload: { user_id: p.user_id } });
@@ -2098,6 +2121,24 @@ function projectionAction(action, p) {
     toast('Projection fermée.');
   }
 }
+
+// Auteur : page suivante ou précédente du PDF montré (boutons, glisser, flèches du clavier).
+function changeSharePage(delta) {
+  const sh = room.myShare;
+  if (!sh || sh.kind !== 'pdf') return;
+  const page = Math.min(sh.count, Math.max(1, sh.page + delta));
+  if (page === sh.page) return;
+  sh.page = page;
+  broadcastShare();
+  renderProjection();
+  renderHandBar();
+}
+
+document.addEventListener('keydown', e => {
+  if (!room.myShare || room.myShare.kind !== 'pdf' || /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
+  if (e.key === 'ArrowRight' || e.key === 'PageDown') changeSharePage(1);
+  if (e.key === 'ArrowLeft' || e.key === 'PageUp') changeSharePage(-1);
+});
 
 async function renderProjectionPdf(layer, s, mine) {
   const key = layer.dataset.key;
@@ -2111,19 +2152,38 @@ async function renderProjectionPdf(layer, s, mine) {
     if (mine && room.myShare && room.myShare.url === s.url && room.myShare.count !== doc.numPages) {
       room.myShare.count = doc.numPages; // nombre de pages connu une fois le PDF ouvert
       broadcastShare();
+      renderHandBar();
       return renderProjection();
     }
     const page = await doc.getPage(Math.min(s.page, doc.numPages));
     const body = layer.querySelector('.projection-body');
     const canvas = layer.querySelector('canvas');
     if (!body || !canvas || layer.dataset.key !== key) return;
+    // La zone vient d'être créée : on attend qu'elle ait une taille avant de dessiner.
+    for (let i = 0; i < 20 && (!body.clientWidth || !body.clientHeight); i++) {
+      await new Promise(r => requestAnimationFrame(r));
+    }
+    if (layer.dataset.key !== key) return;
+    const pad = 16;
+    const w = Math.max(100, body.clientWidth - pad), h = Math.max(100, body.clientHeight - pad);
     const base = page.getViewport({ scale: 1 });
-    const fit = Math.min(body.clientWidth / base.width, body.clientHeight / base.height) || 1;
-    const viewport = page.getViewport({ scale: fit * (window.devicePixelRatio || 1) });
-    canvas.width = viewport.width;
-    canvas.height = viewport.height;
-    await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+    // Page entière (par défaut) ou pleine largeur avec défilement (« Zoom »).
+    const fit = room.projZoom ? w / base.width : Math.min(w / base.width, h / base.height);
+    const ratio = Math.min(window.devicePixelRatio || 1, 2);
+    const viewport = page.getViewport({ scale: fit * ratio });
+    canvas.width = Math.round(viewport.width);
+    canvas.height = Math.round(viewport.height);
+    canvas.style.width = `${Math.round(viewport.width / ratio)}px`;
+    canvas.style.height = `${Math.round(viewport.height / ratio)}px`;
+    // Un seul dessin à la fois sur la même page (pdf.js refuse deux rendus simultanés).
+    if (layer.renderTask) layer.renderTask.cancel();
+    const task = page.render({ canvasContext: canvas.getContext('2d'), viewport });
+    layer.renderTask = task;
+    await task.promise;
+    if (layer.renderTask === task) layer.renderTask = null;
   } catch (e) {
+    if (e?.name === 'RenderingCancelledException' || layer.dataset.key !== key) return;
+    console.warn('Projection PDF :', e);
     const body = layer.querySelector('.projection-body');
     if (body) body.innerHTML = '<p style="color:#fff">Impossible d’afficher ce PDF.</p>';
   }
@@ -2211,12 +2271,19 @@ function renderHandBar() {
     ? '<button class="btn active" id="doc-stop">⏹ Arrêter de montrer</button><button class="btn" id="doc-pick">🔄 Changer</button>'
     : `<button class="btn" id="doc-pick"${room.shareBusy ? ' disabled' : ''}>${room.shareBusy ? '⏳ Envoi…'
       : screenOk ? '📎 Montrer un document' : '📱 Montrer une capture ou un document'}</button>`);
-  const status = room.myShare ? '<div class="share-status small" id="share-status"></div>' : '';
+  const sh = room.myShare;
+  const pages = sh && sh.kind === 'pdf' && sh.count > 1
+    ? `<div class="page-nav"><button class="btn" data-page="-1"${sh.page <= 1 ? ' disabled' : ''}>◀ Page précédente</button>
+        <strong>${sh.page} / ${sh.count}</strong>
+        <button class="btn primary" data-page="1"${sh.page >= sh.count ? ' disabled' : ''}>Page suivante ▶</button></div>`
+    : '';
+  const status = (sh ? '<div class="share-status small" id="share-status"></div>' : '') + pages;
   bar.innerHTML = room.hand
     ? `<div class="notice warn row spread" style="flex-basis:100%"><span>✋ <strong>Vous avez levé la main.</strong> L’encadreur est prévenu et vous donnera la parole.</span>
         <button class="btn sm" id="hand-toggle">Baisser la main</button></div>${share}`
     : `<button class="btn" id="hand-toggle">✋ Lever la main</button>${share}`;
   bar.insertAdjacentHTML('beforeend', status);
+  bar.querySelectorAll('[data-page]').forEach(b => b.addEventListener('click', () => changeSharePage(Number(b.dataset.page))));
   renderShareStatus();
   bar.querySelector('#hand-toggle').addEventListener('click', () => setHand(!room.hand));
   const shareBtn = bar.querySelector('#share-toggle');
