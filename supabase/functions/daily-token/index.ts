@@ -69,7 +69,15 @@ Deno.serve(async req => {
 
     // Salle privée : on ne peut y entrer qu'avec un jeton délivré ici.
     let room = await fetch(`${DAILY_API}/rooms/${name}`, { headers });
-    if (room.status === 404) {
+    if (room.ok) {
+      // Salle déjà créée (éventuellement par une ancienne version) : on réaffirme
+      // le partage d'écran pour tout le monde.
+      room = await fetch(`${DAILY_API}/rooms/${name}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ properties: { enable_screenshare: true } })
+      });
+    } else if (room.status === 404) {
       room = await fetch(`${DAILY_API}/rooms`, {
         method: 'POST',
         headers,
@@ -100,6 +108,8 @@ Deno.serve(async req => {
           user_id: user.id,
           is_owner: owner,
           enable_screenshare: true,
+          // Chacun peut envoyer micro, caméra et partage d'écran (l'encadreur peut le retirer en direct).
+          permissions: { canSend: true },
           start_audio_off: !owner,
           start_video_off: !owner,
           exp: Math.floor(Date.now() / 1000) + TOKEN_HOURS * 3600
