@@ -703,8 +703,30 @@ tr:last-child td { border-bottom: 0; }
   font-size: .9rem;
 }
 .projection-bar .grow { flex: 1; min-width: 140px; overflow-wrap: anywhere; }
-.projection-body { flex: 1; min-height: 0; display: grid; place-items: center; padding: 8px; overflow: hidden; }
-.projection-body img, .projection-body canvas { max-width: 100%; max-height: 100%; object-fit: contain; }
+.projection-body { position: relative; flex: 1; min-height: 0; overflow: hidden; touch-action: pan-y pinch-zoom; }
+/* Page entière : centrée, jamais plus grande que la zone. */
+.projection-body img, .projection-body canvas {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  max-width: calc(100% - 16px);
+  max-height: calc(100% - 16px);
+  object-fit: contain;
+  background: #fff;
+}
+.projection-body img { width: auto; height: auto; }
+/* « Zoom » : pleine largeur, on fait défiler la page verticalement. */
+.projection.zoom .projection-body { overflow: auto; -webkit-overflow-scrolling: touch; }
+.projection.zoom .projection-body img,
+.projection.zoom .projection-body canvas {
+  position: static;
+  display: block;
+  margin: 8px auto;
+  max-height: none;
+}
+.projection.zoom .projection-body img { width: calc(100% - 16px); }
+.page-nav { flex-basis: 100%; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.page-nav .btn { flex: 1; min-width: 140px; }
 .call-dock .projection { border-radius: inherit; }
 
 /* ---------- Mise à jour du site et accusé de réception de la projection ---------- */
