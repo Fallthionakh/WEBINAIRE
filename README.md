@@ -24,7 +24,8 @@ Site : <https://fallthionakh.github.io/WEBINAIRE/>
 - **Salle d’attente** : toute personne connectée qui ouvre le lien de la salle attend d’être admise par l’organisateur (bandeau avec Admettre / Refuser / Tout admettre, notification sonore). Chaque retour (après avoir quitté, rechargé ou été retiré) repasse par la salle d’attente. Un compte pas encore validé par l’admin peut entrer par un lien si l’organisateur l’admet.
 - **Salle en direct** : chat, questions et sondages en temps réel ; mains levées ; liste des participants avec « Retirer » ; « Agrandir » et plein écran pour tous ; « Copier le lien de la salle ».
 - **Visio qui continue pendant la navigation** : pendant un direct, ouvrir une autre rubrique (Bibliothèque, Tableau de bord…) ne coupe pas l’appel : la visio passe dans une mini-fenêtre en bas à droite (« Revenir à la salle »). L’encadreur ne quitte la visio qu’avec « Terminer le direct » ; l’apprenant avec « Quitter la salle ».
-- **Partage d’écran des apprenants** : bouton « 🖥️ Partager mon écran » sous la vidéo. Le partage d’écran n’est possible que depuis un ordinateur (Chrome, Edge, Firefox) : les navigateurs de téléphone et de tablette ne le permettent pas, un message l’explique.
+- **Partage d’écran des apprenants** : bouton « 🖥️ Partager mon écran » sous la vidéo, sur ordinateur (Chrome, Edge, Firefox).
+- **Projection depuis le téléphone** : les navigateurs de téléphone et de tablette ne permettent pas le partage d’écran ; l’apprenant utilise « 📱 Montrer une capture ou un document » pour afficher en grand, pour toute la salle, une capture d’écran, une photo ou un PDF (il tourne lui-même les pages). Les retardataires le voient aussi ; chacun peut « Voir la visio » ; l’encadreur peut fermer la projection. Fichiers dans le dossier privé `salle` (20 Mo max., photos réduites automatiquement), supprimés à l’arrêt.
 - **Liste de présence automatique** : chaque connexion est enregistrée par le serveur (date, heure de connexion, heure de déconnexion, durée), avec le total par apprenant et les absents. Export Excel / CSV.
 - **Bibliothèque** : PDF, vidéos (lecture intégrée), PowerPoint, Word, Excel, images ; 50 Mo par fichier ; ressources liées à un webinaire.
 - Interface responsive (ordinateur et téléphone), mode sombre automatique.
@@ -48,7 +49,7 @@ passe n'est stocké dans le code.
 
 1. Créer un projet sur [supabase.com](https://supabase.com) (offre gratuite).
 2. Dans **SQL Editor**, exécuter dans l'ordre `supabase/schema.sql`, `supabase/002_approbation_connexions.sql`
-   `supabase/003_inscriptions_ressources.sql`, `supabase/004_salle_attente.sql`, `supabase/005_mot_de_passe.sql`, `supabase/006_retour_salle.sql` et `supabase/007_ressources_inscrits.sql`.
+   `supabase/003_inscriptions_ressources.sql`, `supabase/004_salle_attente.sql`, `supabase/005_mot_de_passe.sql`, `supabase/006_retour_salle.sql`, `supabase/007_ressources_inscrits.sql` et `supabase/008_projection_salle.sql`.
 3. Dans **Authentication → Sign In / Providers → Email**, désactiver *Confirm email*
    (ou configurer un serveur SMTP pour garder la confirmation).
 4. Dans **Authentication → Users → Add user**, créer le compte administrateur

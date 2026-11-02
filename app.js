@@ -1603,7 +1603,11 @@ function emptyRoom() {
     departed: new Map(), // personnes vues dans la salle puis parties : user_id → { ...présence, left_at }
     video: null, call: null, videoError: '',
     background: false, // visio en cours pendant la navigation sur d'autres pages
-    sharing: false     // partage d'écran local en cours
+    sharing: false,    // partage d'écran local en cours
+    myShare: null,     // document que je montre à la salle : { url, kind, name, page, count, at, path }
+    shareBusy: false,  // envoi du document en cours
+    sharesSeen: new Set(),
+    projectionHidden: null // projection masquée par moi (valeur « at » de la projection)
   };
 }
 
@@ -1774,17 +1778,20 @@ function updateDock() {
   if (!dock) return;
   const active = callActive();
   dock.hidden = !active;
-  if (!active) return stopDockSync();
+  if (!active) { renderProjection(); return stopDockSync(); }
   const placeholder = !room.background && document.getElementById('video-stage');
   dock.classList.toggle('mini', !placeholder);
+  renderProjection();
   if (placeholder) return startDockSync();
   stopDockSync();
   dock.removeAttribute('style');
   const w = room.webinar;
   dock.querySelector('.call-dock-title').textContent = w?.title || 'Visio en cours';
   const waiting = room.isHost ? room.lobbyList.length : 0;
+  const proj = currentProjection();
   dock.querySelector('.call-dock-info').textContent = waiting
     ? `🔔 ${waiting} personne${waiting > 1 ? 's' : ''} en salle d’attente`
+    : proj ? `📱 ${proj.user_id === profile.id ? 'Vous montrez' : `${proj.name} montre`} un document`
     : `En direct · 👥 ${onlineList().length} en ligne`;
   dock.querySelector('[data-dock="end"]').textContent = room.isHost ? 'Terminer le direct' : 'Quitter';
 }
@@ -1846,9 +1853,217 @@ function toggleScreenShare() {
   if (room.sharing) return room.call.stopScreenShare();
   const support = window.Daily?.supportedBrowser ? window.Daily.supportedBrowser() : null;
   if (support && support.supportsScreenShare === false) {
-    return toast('Le partage d’écran n’est pas possible depuis ce navigateur (les téléphones et tablettes ne le permettent pas). Utilisez un ordinateur avec Chrome, Edge ou Firefox.', 'error');
+    return toast('Le partage d’écran n’est pas possible depuis un téléphone ou une tablette. Utilisez « 📱 Montrer une capture ou un document ».', 'error');
   }
   room.call.startScreenShare();
+}
+
+// =====================================================================
+// Projection depuis le téléphone : capture d'écran, photo ou PDF montré en grand
+// à toute la salle (les navigateurs mobiles ne permettent pas le partage d'écran).
+// Le document est déposé dans le dossier privé « salle » et annoncé par la
+// présence temps réel : les retardataires le voient aussi, et il disparaît
+// automatiquement quand son auteur quitte la salle.
+// =====================================================================
+
+const SHARE_MAX_BYTES = 20 * 1024 * 1024;
+let projDoc = null; // PDF projeté déjà chargé : { url, doc }
+
+function screenShareSupported() {
+  const support = window.Daily?.supportedBrowser ? window.Daily.supportedBrowser() : null;
+  if (support) return support.supportsScreenShare !== false;
+  return !!navigator.mediaDevices?.getDisplayMedia && !/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+}
+
+function pickShareFile() {
+  const input = Object.assign(document.createElement('input'), { type: 'file', accept: 'image/*,application/pdf' });
+  input.addEventListener('change', () => { if (input.files[0]) startMyShare(input.files[0]); });
+  input.click();
+}
+
+// Photos de téléphone (souvent 4 à 8 Mo) : réduites à 1920 px pour un envoi rapide.
+async function shrinkImage(file) {
+  if (file.size < 1.5e6 || file.type === 'image/gif') return file;
+  try {
+    const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
+    const scale = Math.min(1, 1920 / Math.max(bmp.width, bmp.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(bmp.width * scale);
+    canvas.height = Math.round(bmp.height * scale);
+    canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.85));
+    return blob && blob.size < file.size ? blob : file;
+  } catch (e) {
+    return file;
+  }
+}
+
+async function startMyShare(file) {
+  const id = room.id;
+  const isPdf = file.type === 'application/pdf';
+  if (!isPdf && !/^image\/(jpeg|png|webp|gif)$/.test(file.type)) {
+    return toast('Choisissez une capture d’écran, une photo (JPG, PNG) ou un PDF.', 'error');
+  }
+  room.shareBusy = true;
+  renderHandBar();
+  try {
+    const blob = isPdf ? file : await shrinkImage(file);
+    if (blob.size > SHARE_MAX_BYTES) throw new Error('Fichier trop lourd : 20 Mo maximum.');
+    const type = blob.type || file.type;
+    const ext = isPdf ? 'pdf' : type.split('/')[1].replace('jpeg', 'jpg');
+    const path = `${id}/${profile.id}/${Date.now()}.${ext}`;
+    const { error } = await sb.storage.from('salle').upload(path, blob, { contentType: type });
+    if (error) throw error;
+    const { data, error: err } = await sb.storage.from('salle').createSignedUrl(path, 6 * 3600);
+    if (err) throw err;
+    if (room.id !== id) return sb.storage.from('salle').remove([path]);
+    const previous = room.myShare;
+    room.myShare = {
+      url: data.signedUrl, kind: isPdf ? 'pdf' : 'image', name: file.name || 'Capture',
+      page: 1, count: 1, at: new Date().toISOString(), path
+    };
+    room.projectionHidden = null;
+    trackMe();
+    renderProjection();
+    if (previous?.path) sb.storage.from('salle').remove([previous.path]);
+    toast('Votre document est affiché pour toute la salle.', 'success');
+  } catch (e) {
+    fail(e);
+  } finally {
+    room.shareBusy = false;
+    renderHandBar();
+  }
+}
+
+function stopMyShare(message) {
+  const share = room.myShare;
+  if (!share) return;
+  room.myShare = null;
+  trackMe();
+  renderProjection();
+  renderHandBar();
+  if (share.path) sb.storage.from('salle').remove([share.path]);
+  if (message) toast(message);
+}
+
+// Projection affichée : la plus récente parmi les personnes présentes.
+function currentProjection() {
+  if (!room.id) return null;
+  const list = onlineList()
+    .map(p => (p.user_id === profile.id ? { ...p, share: room.myShare } : p))
+    .filter(p => p.share && p.share.url);
+  if (room.myShare && !list.some(p => p.user_id === profile.id)) {
+    list.push({ user_id: profile.id, name: profile.full_name, share: room.myShare });
+  }
+  list.sort((a, b) => (b.share.at || '').localeCompare(a.share.at || ''));
+  return list[0] || null;
+}
+
+// La projection recouvre la visio (dans le dock) ou, sans visio, la scène de la page.
+function projectionHolder() {
+  if (room.background) return null;
+  if (callActive()) return dock && !dock.hidden && !dock.classList.contains('mini') ? dock : null;
+  return document.querySelector('#view .stage');
+}
+
+function renderProjection() {
+  const p = currentProjection();
+  let layer = document.getElementById('projection');
+  const holder = projectionHolder();
+  renderProjectionChip(p);
+  if (!p || !holder || room.projectionHidden === p.share.at) {
+    if (layer) layer.remove();
+    return;
+  }
+  if (!layer || layer.parentElement !== holder) {
+    if (layer) layer.remove();
+    layer = document.createElement('div');
+    layer.id = 'projection';
+    layer.className = 'projection';
+    holder.append(layer);
+  }
+  const s = p.share;
+  const mine = p.user_id === profile.id;
+  const key = `${s.url}|${s.page}|${s.count}|${room.isHost}`;
+  if (layer.dataset.key === key) return;
+  layer.dataset.key = key;
+  const pages = s.kind === 'pdf' && s.count > 1
+    ? (mine
+      ? `<button class="btn sm" data-proj="prev" aria-label="Page précédente">◀</button><span class="small">${s.page} / ${s.count}</span>
+         <button class="btn sm" data-proj="next" aria-label="Page suivante">▶</button>`
+      : `<span class="small">${s.page} / ${s.count}</span>`)
+    : '';
+  layer.innerHTML = `
+    <div class="projection-bar">
+      <span class="grow">📱 <strong>${mine ? 'Vous montrez' : `${esc(p.name)} montre`}</strong> · ${esc(s.name)}</span>
+      ${pages}
+      <button class="btn sm" data-proj="hide">${callActive() ? '🎥 Voir la visio' : 'Masquer'}</button>
+      ${mine || room.isHost ? `<button class="btn sm danger" data-proj="stop">${mine ? 'Arrêter' : 'Fermer'}</button>` : ''}
+    </div>
+    <div class="projection-body">${s.kind === 'image' ? `<img src="${esc(s.url)}" alt="${esc(s.name)}">` : '<canvas></canvas>'}</div>`;
+  layer.querySelectorAll('[data-proj]').forEach(b => b.addEventListener('click', () => projectionAction(b.dataset.proj, p)));
+  if (s.kind === 'pdf') renderProjectionPdf(layer, s, mine);
+}
+
+function renderProjectionChip(p) {
+  const chip = document.getElementById('projection-chip');
+  if (!chip) return;
+  chip.innerHTML = p && room.projectionHidden === p.share.at
+    ? `<div class="stage-tools"><button class="btn" id="proj-show">📱 ${p.user_id === profile.id ? 'Afficher mon document' : `Afficher le document de ${esc(p.name)}`}</button></div>`
+    : '';
+  const show = chip.querySelector('#proj-show');
+  if (show) show.addEventListener('click', () => { room.projectionHidden = null; renderProjection(); });
+}
+
+function projectionAction(action, p) {
+  if (action === 'hide') {
+    room.projectionHidden = p.share.at;
+    return renderProjection();
+  }
+  if ((action === 'prev' || action === 'next') && room.myShare) {
+    const page = Math.min(room.myShare.count, Math.max(1, room.myShare.page + (action === 'next' ? 1 : -1)));
+    if (page === room.myShare.page) return;
+    room.myShare.page = page;
+    trackMe();
+    return renderProjection();
+  }
+  if (action === 'stop') {
+    if (p.user_id === profile.id) return stopMyShare();
+    room.channel?.send({ type: 'broadcast', event: 'stop-share', payload: { user_id: p.user_id } });
+    room.projectionHidden = p.share.at;
+    renderProjection();
+    toast('Projection fermée.');
+  }
+}
+
+async function renderProjectionPdf(layer, s, mine) {
+  const key = layer.dataset.key;
+  try {
+    const pdfjs = await loadPdfJs();
+    if (!projDoc || projDoc.url !== s.url) {
+      if (projDoc) projDoc.doc.destroy();
+      projDoc = { url: s.url, doc: await pdfjs.getDocument({ url: s.url }).promise };
+    }
+    const doc = projDoc.doc;
+    if (mine && room.myShare && room.myShare.url === s.url && room.myShare.count !== doc.numPages) {
+      room.myShare.count = doc.numPages; // nombre de pages connu une fois le PDF ouvert
+      trackMe();
+      return renderProjection();
+    }
+    const page = await doc.getPage(Math.min(s.page, doc.numPages));
+    const body = layer.querySelector('.projection-body');
+    const canvas = layer.querySelector('canvas');
+    if (!body || !canvas || layer.dataset.key !== key) return;
+    const base = page.getViewport({ scale: 1 });
+    const fit = Math.min(body.clientWidth / base.width, body.clientHeight / base.height) || 1;
+    const viewport = page.getViewport({ scale: fit * (window.devicePixelRatio || 1) });
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+  } catch (e) {
+    const body = layer.querySelector('.projection-body');
+    if (body) body.innerHTML = '<p style="color:#fff">Impossible d’afficher ce PDF.</p>';
+  }
 }
 
 // =====================================================================
@@ -1909,9 +2124,11 @@ function renderSupports() {
 function trackMe() {
   // Seules les personnes admises apparaissent dans la liste des participants.
   if (!room.channel || (!room.isHost && room.lobby !== 'admis')) return;
+  const sh = room.myShare;
   room.channel.track({
     user_id: profile.id, name: profile.full_name, role: profile.role,
-    joined_at: room.joinedAt, hand: room.hand, hand_at: room.handAt
+    joined_at: room.joinedAt, hand: room.hand, hand_at: room.handAt,
+    share: sh ? { url: sh.url, kind: sh.kind, name: sh.name, page: sh.page, count: sh.count, at: sh.at } : null
   });
 }
 
@@ -1925,9 +2142,14 @@ function setHand(raised) {
 function renderHandBar() {
   const bar = document.getElementById('hand-bar');
   if (!bar) return;
-  const share = callActive()
+  // Partage d'écran sur ordinateur ; sur téléphone/tablette (non pris en charge), projection d'un document.
+  const screenOk = screenShareSupported();
+  const share = (callActive() && screenOk
     ? `<button class="btn${room.sharing ? ' active' : ''}" id="share-toggle">${room.sharing ? '⏹ Arrêter le partage' : '🖥️ Partager mon écran'}</button>`
-    : '';
+    : '') + (room.myShare
+    ? '<button class="btn active" id="doc-stop">⏹ Arrêter de montrer</button><button class="btn" id="doc-pick">🔄 Changer</button>'
+    : `<button class="btn" id="doc-pick"${room.shareBusy ? ' disabled' : ''}>${room.shareBusy ? '⏳ Envoi…'
+      : screenOk ? '📎 Montrer un document' : '📱 Montrer une capture ou un document'}</button>`);
   bar.innerHTML = room.hand
     ? `<div class="notice warn row spread" style="flex-basis:100%"><span>✋ <strong>Vous avez levé la main.</strong> L’encadreur est prévenu et vous donnera la parole.</span>
         <button class="btn sm" id="hand-toggle">Baisser la main</button></div>${share}`
@@ -1935,6 +2157,10 @@ function renderHandBar() {
   bar.querySelector('#hand-toggle').addEventListener('click', () => setHand(!room.hand));
   const shareBtn = bar.querySelector('#share-toggle');
   if (shareBtn) shareBtn.addEventListener('click', toggleScreenShare);
+  const pick = bar.querySelector('#doc-pick');
+  if (pick) pick.addEventListener('click', pickShareFile);
+  const stop = bar.querySelector('#doc-stop');
+  if (stop) stop.addEventListener('click', () => stopMyShare());
 }
 
 // =====================================================================
@@ -2157,9 +2383,17 @@ async function viewRoom(view, token, id) {
         hands.filter(p => !room.handsSeen.has(p.user_id)).forEach(p => toast(`✋ ${p.name} lève la main`));
       }
       room.handsSeen = new Set(hands.map(p => p.user_id));
+      // Nouvelle projection (capture, photo, PDF) montrée par un participant.
+      const shares = onlineList().filter(p => p.share && p.user_id !== profile.id);
+      shares.filter(p => !room.sharesSeen.has(p.share.at)).forEach(p => toast(`📱 ${p.name} montre un document`));
+      room.sharesSeen = new Set(shares.map(p => p.share.at));
       renderRoomMeta();
+      renderProjection();
       if (room.background) updateDock();
       if (room.tab === 'participants') renderPanel();
+    })
+    .on('broadcast', { event: 'stop-share' }, ({ payload }) => {
+      if (payload.user_id === profile.id) stopMyShare('L’encadreur a fermé votre projection.');
     })
     .on('broadcast', { event: 'lower-hand' }, ({ payload }) => {
       if (payload.user_id === profile.id && room.hand) {
@@ -2253,6 +2487,8 @@ function stopAttendance() {
 
 async function leaveRoom() {
   if (!room.id) return;
+  if (room.myShare?.path) sb.storage.from('salle').remove([room.myShare.path]);
+  document.getElementById('projection')?.remove();
   clearInterval(room.clock);
   // Un participant admis qui quitte pourra revenir directement ; s'il attendait encore, sa demande est retirée.
   if (!room.isHost) sb.rpc('lobby_leave', { w: room.id });
@@ -2429,6 +2665,7 @@ function renderRoomView() {
           ${host ? '<button class="btn sm" id="copy-link">🔗 Copier le lien de la salle</button>' : ''}
         </div>
         ${host ? stageToolbar(w) : ''}
+        <div id="projection-chip"></div>
         ${!host && w.status === 'en_direct' ? '<div class="stage-tools" id="hand-bar"></div>' : ''}
         <div id="supports" style="margin-top:16px"></div>
       </section>
@@ -2455,6 +2692,7 @@ function renderRoomView() {
   const quit = view.querySelector('#quit-room');
   if (quit) quit.addEventListener('click', e => { e.preventDefault(); quitRoom(); });
   updateDock();
+  renderProjection();
 }
 
 // Agrandir la vidéo (masque le panneau latéral) ou la passer en plein écran.

@@ -681,3 +681,28 @@ tr:last-child td { border-bottom: 0; }
 @media (max-width: 600px) {
   .call-dock.mini { right: 8px; bottom: 8px; width: min(300px, calc(100vw - 16px)); }
 }
+
+/* ---------- Projection depuis le téléphone (capture, photo, PDF) ---------- */
+.projection {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  background: #05060a;
+  color: #fff;
+  text-align: left;
+}
+.projection-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, .08);
+  font-size: .9rem;
+}
+.projection-bar .grow { flex: 1; min-width: 140px; overflow-wrap: anywhere; }
+.projection-body { flex: 1; min-height: 0; display: grid; place-items: center; padding: 8px; overflow: hidden; }
+.projection-body img, .projection-body canvas { max-width: 100%; max-height: 100%; object-fit: contain; }
+.call-dock .projection { border-radius: inherit; }
