@@ -631,3 +631,53 @@ tr:last-child td { border-bottom: 0; }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 .loading { display: flex; gap: 10px; align-items: center; justify-content: center; padding: 48px; color: var(--muted); }
+
+/* ---------- Visio persistante (dock Daily) ---------- */
+/* Dans la salle : superposé exactement à la scène (position recalculée en JS).
+   Ailleurs : mini-fenêtre fixe en bas à droite, l'appel continue. */
+.call-dock {
+  position: absolute;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  background: #05060a;
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.call-dock[hidden] { display: none; }
+.call-dock-frame { flex: 1; min-height: 0; }
+.call-dock-frame iframe { width: 100%; height: 100%; border: 0; display: block; }
+.call-dock-bar, .call-dock-actions { display: none; }
+
+.call-dock.mini {
+  position: fixed;
+  z-index: 22;
+  right: 16px;
+  bottom: 16px;
+  width: min(360px, calc(100vw - 32px));
+  height: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow: 0 12px 40px rgba(17, 24, 39, .28);
+}
+.call-dock.mini .call-dock-frame { flex: none; aspect-ratio: 16 / 10; background: #05060a; }
+.call-dock.mini .call-dock-bar { display: flex; align-items: center; gap: 10px; padding: 10px 12px; color: var(--text); }
+.call-dock.mini .call-dock-bar .grow { min-width: 0; flex: 1; }
+.call-dock.mini .call-dock-title { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.call-dock.mini .call-dock-info { color: var(--muted, #6b7280); }
+.call-dock.mini .call-dock-actions { display: flex; gap: 8px; padding: 10px 12px; }
+.call-dock.mini .call-dock-actions .btn { flex: 1; }
+.live-dot { width: 10px; height: 10px; border-radius: 50%; background: #ef4444; flex: none; animation: live-pulse 1.4s ease-in-out infinite; }
+@keyframes live-pulse { 50% { opacity: .35; } }
+
+.call-dock:fullscreen {
+  position: fixed !important;
+  inset: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  border-radius: 0;
+}
+
+@media (max-width: 600px) {
+  .call-dock.mini { right: 8px; bottom: 8px; width: min(300px, calc(100vw - 16px)); }
+}

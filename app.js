@@ -233,7 +233,10 @@ function dateBox(iso) {
 
 async function route() {
   const token = ++renderToken;
-  await leaveRoom();
+  // Visio en cours : naviguer ailleurs ne coupe pas l'appel, il passe en mini-fenêtre.
+  // Seuls « Terminer le direct » (encadreur) ou « Quitter la salle » (apprenant) le ferment.
+  if (room.id && session && callActive()) room.background = true;
+  else await leaveRoom();
   destroyAgenda();
   closeModal();
   let hash = location.hash || '#/';
@@ -1598,7 +1601,9 @@ function emptyRoom() {
     joinedAt: null, hand: false, handAt: null, handsSeen: new Set(),
     lobby: 'admis', lobbyList: [], lobbySeen: new Set(), lobbyError: '', wide: false,
     departed: new Map(), // personnes vues dans la salle puis parties : user_id → { ...présence, left_at }
-    video: null, call: null, videoError: ''
+    video: null, call: null, videoError: '',
+    background: false, // visio en cours pendant la navigation sur d'autres pages
+    sharing: false     // partage d'écran local en cours
   };
 }
 
@@ -1656,10 +1661,14 @@ async function startVideo() {
     try { await leftover.destroy(); } catch (e) { /* déjà détruite */ }
   }
   const box = document.getElementById('video-stage');
-  if (room.id !== id || !box) { room.video = null; return; }
-  box.innerHTML = '';
+  if (room.id !== id || (!box && !room.background)) { room.video = null; return; }
+  if (box) box.innerHTML = '';
+  // L'iframe Daily vit dans le dock, hors de la page : elle n'est jamais déplacée
+  // (déplacer une iframe la recharge), seule sa position change.
+  const frame = dockFrame();
+  frame.innerHTML = '';
   try {
-    room.call = window.Daily.createFrame(box, {
+    room.call = window.Daily.createFrame(frame, {
       iframeStyle: { width: '100%', height: '100%', border: '0' },
       showLeaveButton: false,
       showFullscreenButton: true,
@@ -1670,12 +1679,18 @@ async function startVideo() {
     return videoFailed(id, err?.message);
   }
   room.video = 'on';
+  updateDock();
   room.call.on('error', e => videoFailed(id, e?.errorMsg || e?.error?.type));
+  room.call.on('local-screen-share-started', () => { room.sharing = true; renderHandBar(); });
+  room.call.on('local-screen-share-stopped', () => { room.sharing = false; renderHandBar(); });
+  room.call.on('local-screen-share-canceled', () => { room.sharing = false; renderHandBar(); });
   try {
     await room.call.join({ url: auth.url, token: auth.token });
   } catch (err) {
     videoFailed(id, err?.errorMsg || err?.error?.type || err?.message);
+    return;
   }
+  renderHandBar();
 }
 
 // Erreur Daily (compte, réseau…) : on ferme la visio et on revient au mode local,
@@ -1683,6 +1698,7 @@ async function startVideo() {
 function videoFailed(id, code) {
   if (room.id !== id || room.video === 'off') return;
   console.warn('Erreur Daily :', code);
+  if (room.background) toast('La visio a été interrompue. Revenez dans la salle pour la relancer.', 'error');
   stopVideo();
   room.video = 'off';
   room.videoError = /payment/i.test(code || '')
@@ -1703,7 +1719,136 @@ function stopVideo() {
       .finally(() => { dailyClosing = null; });
   }
   room.call = null;
+  room.sharing = false;
   if (room.video !== 'off') room.video = null;
+  updateDock();
+}
+
+function callActive() {
+  return !!room.call && room.video === 'on';
+}
+
+// =====================================================================
+// Visio persistante : le « dock » contient l'iframe Daily.
+// Dans la salle, il se superpose exactement à la scène ; sur les autres pages,
+// il devient une mini-fenêtre et l'appel continue.
+// =====================================================================
+
+let dock = null;
+let dockRaf = 0;
+let dockRect = '';
+
+function ensureDock() {
+  if (dock) return dock;
+  dock = document.createElement('div');
+  dock.id = 'call-dock';
+  dock.className = 'call-dock';
+  dock.hidden = true;
+  dock.innerHTML = `
+    <div class="call-dock-bar">
+      <span class="live-dot" aria-hidden="true"></span>
+      <div class="grow"><strong class="call-dock-title"></strong><div class="small call-dock-info"></div></div>
+    </div>
+    <div class="call-dock-frame"></div>
+    <div class="call-dock-actions">
+      <button class="btn sm primary" data-dock="back">↩ Revenir à la salle</button>
+      <button class="btn sm danger" data-dock="end"></button>
+    </div>`;
+  dock.addEventListener('click', e => {
+    const b = e.target.closest('[data-dock]');
+    if (!b) return;
+    if (b.dataset.dock === 'back') location.hash = `#/salle/${room.id}`;
+    else if (room.isHost) endLive(room.webinar);
+    else quitRoom();
+  });
+  document.body.append(dock);
+  return dock;
+}
+
+function dockFrame() {
+  return ensureDock().querySelector('.call-dock-frame');
+}
+
+// Place le dock : sur la scène si la salle est affichée, sinon en mini-fenêtre.
+function updateDock() {
+  if (!dock) return;
+  const active = callActive();
+  dock.hidden = !active;
+  if (!active) return stopDockSync();
+  const placeholder = !room.background && document.getElementById('video-stage');
+  dock.classList.toggle('mini', !placeholder);
+  if (placeholder) return startDockSync();
+  stopDockSync();
+  dock.removeAttribute('style');
+  const w = room.webinar;
+  dock.querySelector('.call-dock-title').textContent = w?.title || 'Visio en cours';
+  const waiting = room.isHost ? room.lobbyList.length : 0;
+  dock.querySelector('.call-dock-info').textContent = waiting
+    ? `🔔 ${waiting} personne${waiting > 1 ? 's' : ''} en salle d’attente`
+    : `En direct · 👥 ${onlineList().length} en ligne`;
+  dock.querySelector('[data-dock="end"]').textContent = room.isHost ? 'Terminer le direct' : 'Quitter';
+}
+
+// Suit la position de la scène (défilement, « Agrandir », bandeaux qui apparaissent…).
+function syncDock() {
+  const ph = document.getElementById('video-stage');
+  if (!ph || room.background || !dock || dock.hidden) {
+    dockRaf = 0;
+    updateDock();
+    return;
+  }
+  const r = ph.getBoundingClientRect();
+  const key = `${r.left + scrollX},${r.top + scrollY},${r.width},${r.height}`;
+  if (key !== dockRect) {
+    dockRect = key;
+    Object.assign(dock.style, {
+      left: `${r.left + scrollX}px`, top: `${r.top + scrollY}px`,
+      width: `${r.width}px`, height: `${r.height}px`
+    });
+  }
+  dockRaf = requestAnimationFrame(syncDock);
+}
+
+function startDockSync() {
+  if (!dockRaf) { dockRect = ''; dockRaf = requestAnimationFrame(syncDock); }
+}
+
+function stopDockSync() {
+  cancelAnimationFrame(dockRaf);
+  dockRaf = 0;
+  dockRect = '';
+}
+
+// Encadreur : fin du direct pour tout le monde (seule façon pour lui de quitter la visio).
+async function endLive(w) {
+  if (!w) return;
+  if (!await confirmDialog('Terminer le direct pour tout le monde ?', { confirmLabel: 'Terminer', danger: true })) return;
+  const { error } = await sb.from('webinars').update({ status: 'termine', stage: null }).eq('id', w.id);
+  if (error) return fail(error);
+  await leaveRoom();
+  toast('Direct terminé. La liste de présence est prête.', 'success');
+  location.hash = `#/webinaires/${w.id}`;
+}
+
+// Apprenant : quitter volontairement la salle (il pourra y revenir).
+async function quitRoom() {
+  const w = room.webinar;
+  if (!w) return;
+  if (callActive() && !await confirmDialog('Quitter la salle ? Vous pourrez y revenir tant que le direct continue.',
+    { confirmLabel: 'Quitter' })) return;
+  await leaveRoom();
+  location.hash = `#/webinaires/${w.id}`;
+}
+
+// Partage d'écran (bouton dans la page, en plus de celui de la visio).
+function toggleScreenShare() {
+  if (!room.call) return;
+  if (room.sharing) return room.call.stopScreenShare();
+  const support = window.Daily?.supportedBrowser ? window.Daily.supportedBrowser() : null;
+  if (support && support.supportsScreenShare === false) {
+    return toast('Le partage d’écran n’est pas possible depuis ce navigateur (les téléphones et tablettes ne le permettent pas). Utilisez un ordinateur avec Chrome, Edge ou Firefox.', 'error');
+  }
+  room.call.startScreenShare();
 }
 
 // =====================================================================
@@ -1780,11 +1925,16 @@ function setHand(raised) {
 function renderHandBar() {
   const bar = document.getElementById('hand-bar');
   if (!bar) return;
+  const share = callActive()
+    ? `<button class="btn${room.sharing ? ' active' : ''}" id="share-toggle">${room.sharing ? '⏹ Arrêter le partage' : '🖥️ Partager mon écran'}</button>`
+    : '';
   bar.innerHTML = room.hand
-    ? `<div class="notice warn row spread"><span>✋ <strong>Vous avez levé la main.</strong> L’encadreur est prévenu et vous donnera la parole.</span>
-        <button class="btn sm" id="hand-toggle">Baisser la main</button></div>`
-    : '<button class="btn" id="hand-toggle">✋ Lever la main</button>';
+    ? `<div class="notice warn row spread" style="flex-basis:100%"><span>✋ <strong>Vous avez levé la main.</strong> L’encadreur est prévenu et vous donnera la parole.</span>
+        <button class="btn sm" id="hand-toggle">Baisser la main</button></div>${share}`
+    : `<button class="btn" id="hand-toggle">✋ Lever la main</button>${share}`;
   bar.querySelector('#hand-toggle').addEventListener('click', () => setHand(!room.hand));
+  const shareBtn = bar.querySelector('#share-toggle');
+  if (shareBtn) shareBtn.addEventListener('click', toggleScreenShare);
 }
 
 // =====================================================================
@@ -1808,6 +1958,7 @@ async function loadLobby() {
   }
   room.lobbySeen = new Set(room.lobbyList.map(r => r.user_id));
   renderRoomMeta();
+  if (room.background) updateDock();
   renderLobbyBar();
   if (room.tab === 'participants') renderPanel();
 }
@@ -1946,6 +2097,7 @@ function removedFromRoom(state, message) {
   room.lobby = state;
   room.hand = false;
   if (message) toast(message, 'error');
+  if (room.background) return leaveRoom();
   renderRoomView();
 }
 
@@ -1962,6 +2114,13 @@ let pdfjsPromise = null;
 let stageToken = 0;
 
 async function viewRoom(view, token, id) {
+  // Retour dans la salle dont la visio tourne en arrière-plan : on réaffiche sans rien couper.
+  if (room.id === id && room.background) {
+    room.background = false;
+    renderRoomView();
+    return;
+  }
+  if (room.id) await leaveRoom(); // visio d'un autre webinaire encore ouverte
   // Chaque entrée passe par la salle d'attente (l'organisateur, lui, est admis d'office).
   const { data: knock, error: knockError } = await sb.rpc('lobby_knock', { w: id });
   if (isStale(token)) return;
@@ -1999,6 +2158,7 @@ async function viewRoom(view, token, id) {
       }
       room.handsSeen = new Set(hands.map(p => p.user_id));
       renderRoomMeta();
+      if (room.background) updateDock();
       if (room.tab === 'participants') renderPanel();
     })
     .on('broadcast', { event: 'lower-hand' }, ({ payload }) => {
@@ -2105,12 +2265,14 @@ async function leaveRoom() {
   }
   stopMedia();
   room = emptyRoom();
+  updateDock();
 }
 
 function kickOut(message) {
+  const background = room.background;
   leaveRoom();
   toast(message, 'error');
-  location.hash = '#/webinaires';
+  if (!background) location.hash = '#/webinaires';
 }
 
 // Fermeture de l'onglet : on enregistre l'heure de départ sans attendre la réponse.
@@ -2130,6 +2292,11 @@ function onWebinarUpdate(next) {
       stopAttendance();
       stopVideo();
       stopMedia();
+      if (room.background) {
+        toast(next.status === 'termine' ? 'Le direct est terminé. Merci pour votre participation.' : 'Le webinaire a été annulé.');
+        leaveRoom();
+        return;
+      }
     }
     renderRoomView();
     if (next.status === 'en_direct') startVideo();
@@ -2193,6 +2360,8 @@ function startClock() {
 }
 
 function renderRoomView() {
+  // Salle en arrière-plan (navigation ailleurs) : on ne touche pas à la page affichée.
+  if (room.background) return updateDock();
   const view = document.getElementById('view');
   const w = room.webinar;
   if (!view || !w) return;
@@ -2208,13 +2377,15 @@ function renderRoomView() {
     renderLobbyBar();
     renderSupports();
     renderPanel();
+    updateDock();
     return;
   }
 
   const videoMode = w.status === 'en_direct' && room.video !== 'off';
   let stage;
   if (videoMode) {
-    stage = `<div id="video-stage" class="video-stage">${loading('Connexion à la visio…')}</div>`;
+    // Emplacement de la visio : le dock (iframe Daily) vient s'y superposer.
+    stage = `<div id="video-stage" class="video-stage">${room.call ? '' : loading('Connexion à la visio…')}</div>`;
   } else if (w.status === 'en_direct' && host) {
     stage = '<div id="stage-host" class="stage-host"></div>';
   } else if (w.status === 'en_direct') {
@@ -2240,7 +2411,9 @@ function renderRoomView() {
   view.innerHTML = `
     <div class="page-head">
       <div>
-        <a class="back" href="#/webinaires/${w.id}">← Quitter la salle</a>
+        ${host
+          ? `<a class="back" href="#/webinaires/${w.id}">← Détails du webinaire</a>`
+          : '<a class="back" href="#" id="quit-room">← Quitter la salle</a>'}
         <div class="row" style="margin-bottom:6px">${statusBadge(w)}<span class="muted small" id="online-count"></span></div>
         <div class="row" style="margin-bottom:6px"><span id="teacher-status"></span><strong class="small" id="live-clock"></strong></div>
         <h1>${esc(w.title)}</h1>
@@ -2279,6 +2452,9 @@ function renderRoomView() {
   renderSupports();
   renderPanel();
   startClock();
+  const quit = view.querySelector('#quit-room');
+  if (quit) quit.addEventListener('click', e => { e.preventDefault(); quitRoom(); });
+  updateDock();
 }
 
 // Agrandir la vidéo (masque le panneau latéral) ou la passer en plein écran.
@@ -2291,7 +2467,7 @@ function bindZoomButtons(view, w) {
     wide.textContent = room.wide ? '↙ Réduire' : '↗ Agrandir';
   });
   view.querySelector('#zoom-full').addEventListener('click', () => {
-    const stage = view.querySelector('.stage');
+    const stage = callActive() && dock && !dock.hidden ? dock : view.querySelector('.stage');
     const request = stage.requestFullscreen || stage.webkitRequestFullscreen;
     if (request) request.call(stage);
     else toast('Le plein écran n’est pas disponible sur cet appareil : utilisez « Agrandir ».');
@@ -2315,7 +2491,8 @@ function stageToolbar(w) {
         <button class="btn danger" id="end-live">Terminer le direct</button>
       </div>
       <p class="hint" style="margin-top:8px">Dans la visio : caméra, micro, <strong>Partager l’écran</strong>,
-        et dans la liste <strong>People</strong> / <strong>Participants</strong>, couper le micro ou retirer un participant.</p>`;
+        et dans la liste <strong>People</strong> / <strong>Participants</strong>, couper le micro ou retirer un participant.
+        Vous pouvez ouvrir les autres rubriques : la visio continue dans une mini-fenêtre.</p>`;
   }
   return `
     ${room.videoError ? `<div class="notice warn" style="margin-top:12px">Visio indisponible (${esc(room.videoError)}).
@@ -2350,13 +2527,7 @@ function bindStageToolbar(w) {
     if (error) return fail(error);
     onWebinarUpdate({ status: 'en_direct' });
   });
-  on('#end-live', async () => {
-    if (!await confirmDialog('Terminer le direct pour tout le monde ?', { confirmLabel: 'Terminer', danger: true })) return;
-    const { error } = await sb.from('webinars').update({ status: 'termine', stage: null }).eq('id', w.id);
-    if (error) return fail(error);
-    toast('Direct terminé. La liste de présence est prête.', 'success');
-    location.hash = `#/webinaires/${w.id}`;
-  });
+  on('#end-live', () => endLive(w));
   on('#fullscreen', () => {
     const el = view.querySelector('.stage');
     if (el.requestFullscreen) el.requestFullscreen();
