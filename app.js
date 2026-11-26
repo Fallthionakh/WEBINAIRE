@@ -4,7 +4,7 @@
 // appliqués par la base (voir supabase/schema.sql), pas seulement ici.
 
 // Version du site : à changer à chaque mise à jour, ici, dans version.json et dans index.html.
-const APP_VERSION = '2026-11-02-7';
+const APP_VERSION = '2026-11-26-1';
 
 const CONFIG = window.WEBINAIRE_CONFIG || {};
 const configured = Boolean(CONFIG.supabaseUrl && CONFIG.supabaseKey && window.supabase);
@@ -309,6 +309,9 @@ async function route() {
   if ((m = hash.match(/^#\/salle\/([\w-]+)$/))) return viewRoom(view, token, m[1]);
   if (hash === '#/bibliotheque') return viewLibrary(view, token);
   if (hash === '#/utilisateurs' && profile.role === 'admin') return viewAdmin(view, token);
+  if (hash === '#/encadreurs' && profile.role === 'admin') return viewEncadreurs(view, token);
+  if (hash === '#/encadreurs/nouveau' && profile.role === 'admin') return viewEncadreur(view, token, null);
+  if ((m = hash.match(/^#\/encadreurs\/([\w-]+)$/)) && profile.role === 'admin') return viewEncadreur(view, token, m[1]);
   if (hash === '#/profil') return viewProfile(view, token);
   if (hash === '#/mes-inscriptions' && profile.role === 'apprenant') return viewMyRegistrations(view, token);
   location.hash = '#/';
@@ -349,7 +352,7 @@ function renderShell(hash) {
     ['#/bibliotheque', '📚', 'Bibliothèque']
   ];
   if (profile.role === 'apprenant') links.splice(2, 0, ['#/mes-inscriptions', '📝', 'Mes inscriptions']);
-  if (profile.role === 'admin') links.push(['#/utilisateurs', '👥', 'Utilisateurs']);
+  if (profile.role === 'admin') links.push(['#/encadreurs', '🧑‍🏫', 'Encadreurs'], ['#/utilisateurs', '👥', 'Utilisateurs']);
   links.push(['#/profil', '⚙️', 'Mon profil']);
 
   const active = href => (href === '#/' ? hash === '#/' : hash.startsWith(href)) ||
@@ -2482,7 +2485,7 @@ function askOpenInRoom(r, type) {
   });
 }
 
-async function openDocViewer(r, type) {
+async function openDocViewer(r, type, bucket = 'bibliotheque') {
   closeDocViewer();
   const title = r.title || r.file_name;
   const el = document.createElement('div');
@@ -2491,7 +2494,7 @@ async function openDocViewer(r, type) {
   el.innerHTML = `
     <div class="doc-viewer-bar">
       <strong class="grow">${type === 'pdf' ? '📕' : '🖼️'} ${esc(title)}</strong>
-      ${room.id ? '<button class="btn sm primary" id="dv-share">📱 Montrer à tous</button>' : ''}
+      ${room.id && bucket === 'bibliotheque' ? '<button class="btn sm primary" id="dv-share">📱 Montrer à tous</button>' : ''}
       <button class="btn sm" id="dv-close">✕ Fermer</button>
     </div>
     <div class="doc-viewer-body">${loading('Ouverture du document…')}</div>`;
@@ -2503,7 +2506,7 @@ async function openDocViewer(r, type) {
   const share = el.querySelector('#dv-share');
   if (share) share.addEventListener('click', () => { closeDocViewer(); shareLibraryResource(r, type); });
 
-  const { data, error } = await sb.storage.from('bibliotheque').createSignedUrl(r.file_path, 3600);
+  const { data, error } = await sb.storage.from(bucket).createSignedUrl(r.file_path, 3600);
   const body = el.querySelector('.doc-viewer-body');
   if (!docViewer || docViewer.r !== r) return;
   if (error) { closeDocViewer(); return fail(error); }
@@ -4113,6 +4116,285 @@ async function uploadDialog(onDone, presetWebinarId = '') {
 // =====================================================================
 // Administration : encadreurs et utilisateurs
 // =====================================================================
+
+// =====================================================================
+// Encadreurs (administrateur) : une fiche par encadreur — nom, prénom,
+// téléphone, e-mail, documents (CV, diplômes, attestations…) consultables en
+// ligne. « Accès à la plateforme » lui donne le rôle encadreur (migration 009).
+// =====================================================================
+
+const ENCADREUR_SELECT = '*, documents:encadreur_documents(count), profile:profiles!encadreurs_profile_id_fkey(id, role, full_name)';
+
+function encadreurName(e) {
+  return `${e.prenom} ${(e.nom || '').toUpperCase()}`.trim();
+}
+
+function encadreurAccount(e) {
+  if (e.profile) {
+    return e.profile.role === 'admin'
+      ? '<span class="badge">👑 Compte administrateur</span>'
+      : e.profile.role === 'encadreur'
+        ? '<span class="badge ok">✅ Compte actif</span>'
+        : `<span class="badge">Compte : ${esc(ROLE_LABELS[e.profile.role] || e.profile.role)}</span>`;
+  }
+  return e.acces
+    ? '<span class="badge warn" title="Il recevra le rôle encadreur en créant son compte avec cet e-mail">⏳ Pas encore inscrit</span>'
+    : '<span class="badge">Sans accès à la plateforme</span>';
+}
+
+async function viewEncadreurs(view, token) {
+  const { data: list, error } = await sb.from('encadreurs').select(ENCADREUR_SELECT).order('nom').order('prenom');
+  if (isStale(token)) return;
+  if (error) {
+    return (view.innerHTML = `<div class="notice danger">${esc(translateError(error))}
+      <p class="small" style="margin-top:8px">Si la rubrique est nouvelle : exécutez <code>supabase/009_encadreurs.sql</code> dans Supabase → SQL Editor.</p></div>`);
+  }
+  let search = '';
+  view.innerHTML = `
+    <div class="page-head">
+      <div>
+        <h1>Encadreurs</h1>
+        <p class="muted">Fiches des encadreurs : coordonnées et documents (CV, diplômes, attestations…).</p>
+      </div>
+      <a class="btn primary" href="#/encadreurs/nouveau">＋ Nouvel encadreur</a>
+    </div>
+    <div class="toolbar"><input class="search" id="enc-search" type="search" placeholder="Rechercher (nom, téléphone, e-mail)…"></div>
+    <div id="enc-results"></div>`;
+
+  const draw = () => {
+    const shown = list.filter(e => !search ||
+      `${e.prenom} ${e.nom} ${e.telephone} ${e.email}`.toLowerCase().includes(search));
+    const box = view.querySelector('#enc-results');
+    if (!shown.length) {
+      box.innerHTML = `<div class="card">${emptyState('🧑‍🏫', list.length ? 'Aucun encadreur ne correspond.'
+        : 'Aucun encadreur pour le moment.', list.length ? '' : '<a class="btn primary" href="#/encadreurs/nouveau">＋ Créer la première fiche</a>')}</div>`;
+      return;
+    }
+    box.innerHTML = `<div class="card list">${shown.map(e => {
+      const docs = e.documents?.[0]?.count || 0;
+      return `
+        <a class="enc-row" href="#/encadreurs/${e.id}">
+          <span class="avatar">${esc(initials(`${e.prenom} ${e.nom}`))}</span>
+          <span class="enc-main">
+            <strong>${esc(encadreurName(e))}</strong>
+            <span class="muted small">${e.telephone ? `📞 ${esc(e.telephone)} · ` : ''}✉️ ${esc(e.email)}</span>
+          </span>
+          <span class="enc-tags">
+            <span class="badge">📎 ${docs} document${docs > 1 ? 's' : ''}</span>
+            ${encadreurAccount(e)}
+          </span>
+        </a>`;
+    }).join('')}</div>
+    <p class="muted small" style="margin-top:8px">${shown.length} encadreur${shown.length > 1 ? 's' : ''}</p>`;
+  };
+  view.querySelector('#enc-search').addEventListener('input', e => { search = e.target.value.trim().toLowerCase(); draw(); });
+  draw();
+}
+
+async function viewEncadreur(view, token, id) {
+  let e = null;
+  let docs = [];
+  if (id) {
+    const [{ data, error }, { data: d, error: de }] = await Promise.all([
+      sb.from('encadreurs').select(ENCADREUR_SELECT).eq('id', id).maybeSingle(),
+      sb.from('encadreur_documents').select('*').eq('encadreur_id', id).order('created_at', { ascending: false })
+    ]);
+    if (isStale(token)) return;
+    if (error || de) return (view.innerHTML = `<div class="notice danger">${esc(translateError(error || de))}</div>`);
+    if (!data) return (view.innerHTML = `<div class="notice danger">Fiche introuvable.</div>`);
+    e = data;
+    docs = d || [];
+  }
+
+  view.innerHTML = `
+    <a class="back" href="#/encadreurs">← Encadreurs</a>
+    <div class="page-head">
+      <div>
+        <h1>${e ? esc(encadreurName(e)) : 'Nouvel encadreur'}</h1>
+        ${e ? `<p class="muted">${encadreurAccount(e)}</p>` : ''}
+      </div>
+    </div>
+    <div class="enc-layout">
+      <form class="card" id="enc-form" novalidate>
+        <h2>Coordonnées</h2>
+        <div class="form-grid">
+          <label>Prénom<input name="prenom" required maxlength="80" autocomplete="given-name" value="${esc(e?.prenom || '')}"></label>
+          <label>Nom<input name="nom" required maxlength="80" autocomplete="family-name" value="${esc(e?.nom || '')}"></label>
+          <label>Téléphone<input name="telephone" type="tel" maxlength="40" autocomplete="tel" placeholder="77 123 45 67" value="${esc(e?.telephone || '')}"></label>
+          <label>E-mail<input name="email" type="email" required maxlength="160" autocomplete="email" value="${esc(e?.email || '')}"></label>
+        </div>
+        <label>Notes (facultatif)<textarea name="notes" rows="3" maxlength="2000" placeholder="Spécialité, disponibilités…">${esc(e?.notes || '')}</textarea></label>
+        <label class="check"><input type="checkbox" name="acces" ${!e || e.acces ? 'checked' : ''}>
+          Donner accès à la plateforme (rôle encadreur)</label>
+        <p class="hint">L’encadreur pourra animer des webinaires en se connectant avec cet e-mail : tout de suite s’il a déjà un compte,
+          sinon dès qu’il le crée (« Créer un compte » sur la page de connexion).</p>
+        ${e ? '' : `
+          <h2 style="margin-top:20px">Documents (facultatif)</h2>
+          <p class="muted small">CV, diplômes, attestations… PDF, images ou Word, 50 Mo maximum par fichier.</p>
+          <input type="file" name="files" multiple accept=".pdf,.doc,.docx,.odt,.txt,image/*">
+          <div id="enc-picked" class="small muted" style="margin-top:6px"></div>`}
+        <div class="actions">
+          ${e ? '<button class="btn danger ghost" type="button" id="enc-delete">🗑 Supprimer la fiche</button>' : '<a class="btn" href="#/encadreurs">Annuler</a>'}
+          <button class="btn primary" type="submit">${e ? 'Enregistrer' : 'Créer la fiche'}</button>
+        </div>
+      </form>
+      ${e ? `
+        <section class="card" id="enc-docs">
+          <div class="row spread">
+            <h2 style="margin:0">Documents (${docs.length})</h2>
+            <button class="btn primary sm" id="enc-add">＋ Ajouter</button>
+          </div>
+          <div id="enc-doc-list" style="margin-top:12px"></div>
+        </section>` : ''}
+    </div>`;
+
+  const form = view.querySelector('#enc-form');
+  const picker = form.files;
+  if (picker) picker.addEventListener('change', () => {
+    view.querySelector('#enc-picked').textContent = [...picker.files].map(f => `${f.name} (${fmtSize(f.size)})`).join(' · ');
+  });
+
+  form.addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const values = {
+      prenom: form.prenom.value.trim(),
+      nom: form.nom.value.trim(),
+      telephone: form.telephone.value.trim(),
+      email: form.email.value.trim().toLowerCase(),
+      notes: form.notes.value.trim(),
+      acces: form.acces.checked
+    };
+    if (!values.prenom || !values.nom) return toast('Le prénom et le nom sont obligatoires.', 'error');
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(values.email)) return toast('Adresse e-mail invalide.', 'error');
+    const btn = form.querySelector('[type=submit]');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Enregistrement…';
+    const query = e
+      ? sb.from('encadreurs').update(values).eq('id', e.id)
+      : sb.from('encadreurs').insert(values);
+    const { data, error } = await query.select('id').single();
+    if (error) {
+      btn.disabled = false;
+      btn.textContent = e ? 'Enregistrer' : 'Créer la fiche';
+      return fail(/duplicate|unique/i.test(error.message) ? new Error('Un encadreur avec cet e-mail existe déjà.') : error);
+    }
+    if (!e && picker?.files.length) {
+      btn.innerHTML = '<span class="spinner"></span> Envoi des documents…';
+      await uploadEncadreurDocs(data.id, [...picker.files]);
+    }
+    toast(e ? 'Fiche enregistrée.' : 'Encadreur créé.', 'success');
+    if (e) viewEncadreur(view, ++renderToken, e.id);
+    else location.hash = `#/encadreurs/${data.id}`;
+  });
+
+  if (!e) return;
+
+  view.querySelector('#enc-delete').addEventListener('click', async () => {
+    if (!await confirmDialog(`Supprimer la fiche de ${encadreurName(e)} et ses ${docs.length} document(s) ?`,
+      { confirmLabel: 'Supprimer', danger: true })) return;
+    if (docs.length) await sb.storage.from('encadreurs').remove(docs.map(d => d.file_path));
+    const { error } = await sb.from('encadreurs').delete().eq('id', e.id);
+    if (error) return fail(error);
+    toast('Fiche supprimée. Son compte éventuel n’est pas modifié (voir « Utilisateurs »).');
+    location.hash = '#/encadreurs';
+  });
+
+  view.querySelector('#enc-add').addEventListener('click', () => {
+    const input = Object.assign(document.createElement('input'), {
+      type: 'file', multiple: true, accept: '.pdf,.doc,.docx,.odt,.txt,image/*'
+    });
+    input.addEventListener('change', async () => {
+      if (!input.files.length) return;
+      await uploadEncadreurDocs(e.id, [...input.files]);
+      viewEncadreur(view, ++renderToken, e.id);
+    });
+    input.click();
+  });
+
+  const listBox = view.querySelector('#enc-doc-list');
+  listBox.innerHTML = docs.length ? docs.map(d => {
+    const t = fileType(d);
+    return `
+      <div class="enc-doc">
+        <span class="enc-doc-ico">${FILE_TYPES[t][0]}</span>
+        <span class="enc-main">
+          <strong>${esc(d.title)}</strong>
+          <span class="muted small">${esc(d.file_name)} · ${fmtSize(d.size_bytes)} · ${esc(fmtShortDate(d.created_at))}</span>
+        </span>
+        <span class="enc-doc-actions">
+          ${VIEWABLE.has(t) ? `<button class="btn sm primary" data-view="${d.id}">👁 Voir</button>` : ''}
+          <button class="btn sm" data-dl="${d.id}" title="Télécharger">⬇</button>
+          <button class="btn sm" data-rename="${d.id}" title="Renommer">✏️</button>
+          <button class="btn sm danger ghost" data-del="${d.id}" title="Supprimer">🗑</button>
+        </span>
+      </div>`;
+  }).join('') : emptyState('📎', 'Aucun document. Ajoutez un CV, des diplômes, des attestations…');
+
+  const doc = id2 => docs.find(d => d.id === id2);
+  listBox.querySelectorAll('[data-view]').forEach(b => b.addEventListener('click', () => viewEncadreurDoc(doc(b.dataset.view))));
+  listBox.querySelectorAll('[data-dl]').forEach(b => b.addEventListener('click', async () => {
+    const d = doc(b.dataset.dl);
+    const { data, error } = await sb.storage.from('encadreurs').createSignedUrl(d.file_path, 600, { download: d.file_name });
+    if (error) return fail(error);
+    const a = Object.assign(document.createElement('a'), { href: data.signedUrl, download: d.file_name });
+    document.body.append(a);
+    a.click();
+    a.remove();
+  }));
+  listBox.querySelectorAll('[data-rename]').forEach(b => b.addEventListener('click', async () => {
+    const d = doc(b.dataset.rename);
+    const title = await confirmDialog(`Nouveau titre pour « ${d.title} »`, { confirmLabel: 'Renommer', input: 'Titre' });
+    if (typeof title !== 'string' || !title) return;
+    const { error } = await sb.from('encadreur_documents').update({ title: title.slice(0, 160) }).eq('id', d.id);
+    if (error) return fail(error);
+    viewEncadreur(view, ++renderToken, e.id);
+  }));
+  listBox.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', async () => {
+    const d = doc(b.dataset.del);
+    if (!await confirmDialog(`Supprimer « ${d.title} » ?`, { confirmLabel: 'Supprimer', danger: true })) return;
+    await sb.storage.from('encadreurs').remove([d.file_path]);
+    const { error } = await sb.from('encadreur_documents').delete().eq('id', d.id);
+    if (error) return fail(error);
+    toast('Document supprimé.');
+    viewEncadreur(view, ++renderToken, e.id);
+  }));
+}
+
+async function uploadEncadreurDocs(encadreurId, files) {
+  let ok = 0;
+  for (const file of files) {
+    if (file.size > MAX_FILE_BYTES) {
+      toast(`« ${file.name} » est trop volumineux (${fmtSize(file.size)}). Maximum : 50 Mo.`, 'error');
+      continue;
+    }
+    const path = `${encadreurId}/${Date.now()}-${slug(file.name)}`;
+    const { error: e1 } = await sb.storage.from('encadreurs').upload(path, file, {
+      contentType: file.type || 'application/octet-stream', upsert: false
+    });
+    if (e1) { fail(e1); continue; }
+    const { error: e2 } = await sb.from('encadreur_documents').insert({
+      encadreur_id: encadreurId,
+      title: file.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').slice(0, 160) || file.name,
+      file_path: path,
+      file_name: file.name,
+      mime_type: file.type || '',
+      size_bytes: file.size
+    });
+    if (e2) { await sb.storage.from('encadreurs').remove([path]); fail(e2); continue; }
+    ok++;
+  }
+  if (ok) toast(`${ok} document${ok > 1 ? 's' : ''} ajouté${ok > 1 ? 's' : ''}.`, 'success');
+}
+
+// PDF et images : lecteur intégré (sans quitter la page) ; vidéos : lecteur dans une fenêtre.
+async function viewEncadreurDoc(d) {
+  const t = fileType(d);
+  if (t === 'pdf' || t === 'image') return openDocViewer(d, t, 'encadreurs');
+  const { data, error } = await sb.storage.from('encadreurs').createSignedUrl(d.file_path, 3600);
+  if (error) return fail(error);
+  openModal(`<h2>${esc(d.title)}</h2><video src="${esc(data.signedUrl)}" controls autoplay style="width:100%;border-radius:12px;background:#000"></video>
+    <div class="actions"><button class="btn" data-close>Fermer</button></div>`, { wide: true });
+}
 
 async function viewAdmin(view, token) {
   const [{ data: users, error: e1 }, { data: invites, error: e2 }, { data: pwdRequests }] = await Promise.all([

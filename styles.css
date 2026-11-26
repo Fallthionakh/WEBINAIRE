@@ -780,3 +780,17 @@ body.doc-viewer-open { overflow: hidden; }
   .call-dock.mini .call-dock-actions .btn { padding: 6px 4px; font-size: .75rem; }
 }
 .projection-bar [hidden] { display: none !important; }
+
+/* ---------- Encadreurs ---------- */
+.enc-row, .enc-doc { display: flex; align-items: center; gap: 12px; padding: 12px 0; color: inherit; text-decoration: none; flex-wrap: wrap; }
+.enc-row + .enc-row, .enc-doc + .enc-doc { border-top: 1px solid var(--border); }
+.enc-row:hover strong { color: var(--primary); }
+.enc-main { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 180px; overflow-wrap: anywhere; }
+.enc-tags, .enc-doc-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.enc-doc-ico { font-size: 1.6rem; }
+.enc-layout { display: grid; gap: 16px; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); align-items: start; }
+.enc-layout .card + .card { margin-top: 0; }
+@media (max-width: 900px) { .enc-layout { grid-template-columns: 1fr; } }
+label.check { display: flex; align-items: center; gap: 8px; font-weight: 600; margin-top: 12px; }
+label.check input { width: auto; margin: 0; }
+#enc-form > label { margin-top: 12px; }
