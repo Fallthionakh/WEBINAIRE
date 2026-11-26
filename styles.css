@@ -794,3 +794,31 @@ body.doc-viewer-open { overflow: hidden; }
 label.check { display: flex; align-items: center; gap: 8px; font-weight: 600; margin-top: 12px; }
 label.check input { width: auto; margin: 0; }
 #enc-form > label { margin-top: 12px; }
+
+/* ---------- Utilisateurs : onglets Comptes / Encadreurs / Apprenants ---------- */
+.user-tabs { margin: -4px 0 20px; }
+.tabs a {
+  color: var(--muted);
+  font-weight: 600;
+  padding: 10px 14px;
+  border-bottom: 2px solid transparent;
+  white-space: nowrap;
+  text-decoration: none;
+}
+.tabs a.active { color: var(--primary-text); border-bottom-color: var(--primary); }
+.tabs a:hover { color: var(--text); }
+
+/* ---------- Participants du webinaire et partage du lien ---------- */
+.invite-box { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 16px 16px; margin: 16px 0 0; }
+.invite-box legend { font-weight: 700; padding: 0 6px; }
+.invite-pickers { display: grid; gap: 8px; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); margin-top: 6px; }
+.invite-pickers select { margin: 0; }
+@media (max-width: 600px) { .invite-pickers { grid-template-columns: 1fr; } }
+.inv-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 10px 0 4px; }
+.inv-chip { display: inline-flex; align-items: center; gap: 4px; padding: 4px 6px 4px 10px; border-radius: 999px; background: var(--primary-soft, #eef2ff); color: var(--primary-text, #3730a3); font-size: .85rem; font-weight: 600; }
+.inv-chip button { border: 0; background: none; cursor: pointer; color: inherit; font-size: .8rem; padding: 2px 4px; border-radius: 50%; }
+.inv-chip button:hover { background: rgba(0, 0, 0, .08); }
+.share-grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-top: 12px; }
+.share-grid .btn { white-space: normal; text-align: center; }
+.btn.wa { background: #25d366; border-color: #25d366; color: #fff; }
+.btn.wa:hover { background: #1ebe5a; }

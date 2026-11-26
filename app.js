@@ -4,7 +4,7 @@
 // appliqués par la base (voir supabase/schema.sql), pas seulement ici.
 
 // Version du site : à changer à chaque mise à jour, ici, dans version.json et dans index.html.
-const APP_VERSION = '2026-11-26-1';
+const APP_VERSION = '2026-11-26-2';
 
 const CONFIG = window.WEBINAIRE_CONFIG || {};
 const configured = Boolean(CONFIG.supabaseUrl && CONFIG.supabaseKey && window.supabase);
@@ -247,6 +247,10 @@ async function route() {
 
   if (!configured) return renderSetup();
 
+  // Lien unique du webinaire : nom seulement, puis entrée directe dans la salle.
+  const joinMatch = hash.match(/^#\/rejoindre\/([\w-]+)$/);
+  if (joinMatch && !session) return renderJoin(token, joinMatch[1]);
+
   if (!session) {
     // Lien d'invitation (salle ou webinaire) : on y reviendra après la connexion.
     if (/^#\/(salle|webinaires)\/[\w-]+$/.test(hash)) {
@@ -271,6 +275,8 @@ async function route() {
     }
     profile = data;
   }
+
+  if (joinMatch) return joinWithLink(token, joinMatch[1]);
 
   let next = null;
   try {
@@ -309,9 +315,14 @@ async function route() {
   if ((m = hash.match(/^#\/salle\/([\w-]+)$/))) return viewRoom(view, token, m[1]);
   if (hash === '#/bibliotheque') return viewLibrary(view, token);
   if (hash === '#/utilisateurs' && profile.role === 'admin') return viewAdmin(view, token);
-  if (hash === '#/encadreurs' && profile.role === 'admin') return viewEncadreurs(view, token);
-  if (hash === '#/encadreurs/nouveau' && profile.role === 'admin') return viewEncadreur(view, token, null);
-  if ((m = hash.match(/^#\/encadreurs\/([\w-]+)$/)) && profile.role === 'admin') return viewEncadreur(view, token, m[1]);
+  if (profile.role === 'admin') {
+    // Anciennes adresses de la rubrique Encadreurs (avant son passage dans Utilisateurs).
+    if (hash.startsWith('#/encadreurs')) { location.hash = hash.replace('#/encadreurs', '#/utilisateurs/encadreurs'); return; }
+    if (hash === '#/utilisateurs/encadreurs') return viewEncadreurs(view, token);
+    if (hash === '#/utilisateurs/apprenants') return viewApprenants(view, token);
+    if ((m = hash.match(/^#\/utilisateurs\/encadreurs\/([\w-]+)$/))) return viewEncadreur(view, token, m[1] === 'nouveau' ? null : m[1]);
+    if ((m = hash.match(/^#\/utilisateurs\/apprenants\/([\w-]+)$/))) return viewApprenant(view, token, m[1] === 'nouveau' ? null : m[1]);
+  }
   if (hash === '#/profil') return viewProfile(view, token);
   if (hash === '#/mes-inscriptions' && profile.role === 'apprenant') return viewMyRegistrations(view, token);
   location.hash = '#/';
@@ -345,6 +356,206 @@ async function copyRoomLink(id) {
   }
 }
 
+// =====================================================================
+// Lien unique du webinaire (migration 010) : au clic, on entre directement
+// dans la salle — nom seulement si l'on n'est pas connecté, ni mot de passe
+// ni salle d'attente. Envoi par WhatsApp, SMS ou e-mail.
+// =====================================================================
+
+async function webinarJoinLink(id) {
+  const { data, error } = await sb.from('webinar_links').select('code').eq('webinar_id', id).maybeSingle();
+  if (error || !data) return null; // migration 010 pas encore exécutée
+  return `${SITE_URL}#/rejoindre/${data.code}`;
+}
+
+// Numéro pour WhatsApp : chiffres seulement, indicatif du Sénégal ajouté aux numéros à 9 chiffres.
+function waNumber(phone) {
+  let d = String(phone || '').replace(/\D/g, '');
+  if (d.startsWith('00')) d = d.slice(2);
+  if (d.length === 9) d = `221${d}`;
+  return d;
+}
+
+function inviteMessage(w, link, firstName = '') {
+  return `${firstName ? `Bonjour ${firstName}, v` : 'V'}ous êtes invité(e) au webinaire « ${w.title} » ` +
+    `le ${fmtDate(w.starts_at)} à ${fmtTime(w.starts_at)}.\n` +
+    `Cliquez sur ce lien pour entrer directement (sans mot de passe) :\n${link}`;
+}
+
+function shareLinks(w, link, person = null) {
+  const msg = inviteMessage(w, link, person?.prenom || '');
+  const subject = `Invitation : ${w.title}`;
+  const phone = person?.telephone ? waNumber(person.telephone) : '';
+  return {
+    whatsapp: `https://wa.me/${phone}?text=${encodeURIComponent(msg)}`,
+    sms: `sms:${phone ? `+${phone}` : ''}?&body=${encodeURIComponent(msg)}`,
+    email: `mailto:${person?.email || ''}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(msg)}`
+  };
+}
+
+async function copyText(text, okMessage) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(okMessage, 'success');
+  } catch (e) {
+    toast('Copie impossible : sélectionnez le texte et copiez-le.', 'error');
+  }
+}
+
+async function shareLinkDialog(w, { created = false } = {}) {
+  const link = await webinarJoinLink(w.id);
+  if (!link) return copyRoomLink(w.id); // avant la migration 010 : ancien lien de la salle
+  const { data: inv } = await sb.from('webinar_invites').select('apprenant:apprenants(email)').eq('webinar_id', w.id);
+  const emails = (inv || []).map(x => x.apprenant?.email).filter(Boolean);
+  const links = shareLinks(w, link);
+  openModal(`
+    <h2>${created ? '✅ Webinaire créé : envoyez le lien' : '🔗 Lien du webinaire'}</h2>
+    <p class="muted">Un seul lien pour tout le monde. Au clic, on entre directement dans la salle :
+      la personne non connectée donne seulement son nom (ni e-mail, ni mot de passe, ni salle d’attente).</p>
+    <input readonly id="share-link" value="${esc(link)}" onclick="this.select()" style="margin-top:12px">
+    <div class="share-grid">
+      <button class="btn primary" id="share-copy">📋 Copier le lien</button>
+      <button class="btn" id="share-msg">💬 Copier le message</button>
+      <a class="btn wa" href="${links.whatsapp}" target="_blank" rel="noopener">🟢 WhatsApp</a>
+      <a class="btn" href="${links.sms}">✉️ SMS</a>
+      <a class="btn" href="${emails.length
+        ? `mailto:?bcc=${encodeURIComponent(emails.join(','))}&subject=${encodeURIComponent(`Invitation : ${w.title}`)}&body=${encodeURIComponent(inviteMessage(w, link))}`
+        : links.email}">📧 E-mail${emails.length ? ` aux ${emails.length} invités` : ''}</a>
+    </div>
+    <p class="hint" style="margin-top:12px">Pour inviter chaque apprenant individuellement (WhatsApp avec son numéro), utilisez la liste « Invités » de la page du webinaire.
+      Si le lien a trop circulé, créez-en un nouveau : l’ancien ne fonctionnera plus.</p>
+    <div class="actions">
+      <button class="btn ghost" id="share-renew">🔄 Nouveau lien</button>
+      <button class="btn" data-close>Fermer</button>
+    </div>`);
+  modal.querySelector('#share-copy').addEventListener('click', () => copyText(link, 'Lien copié ✓'));
+  modal.querySelector('#share-msg').addEventListener('click', () => copyText(inviteMessage(w, link), 'Message copié ✓ Collez-le dans WhatsApp ou un SMS.'));
+  modal.querySelector('#share-renew').addEventListener('click', async () => {
+    if (!await confirmDialog('Créer un nouveau lien ? L’ancien lien ne fonctionnera plus.', { confirmLabel: 'Nouveau lien', danger: true })) return;
+    const { error } = await sb.rpc('renew_webinar_link', { w: w.id });
+    if (error) return fail(error);
+    toast('Nouveau lien créé ✓', 'success');
+    shareLinkDialog(w);
+  });
+}
+
+// Page du webinaire : liste des invités, avec envoi du lien à chacun.
+async function renderInvitesCard(box, w) {
+  const [{ data: rows, error }, link] = await Promise.all([
+    sb.from('webinar_invites').select('apprenant:apprenants(id, prenom, nom, filiere, annee, telephone, email, profile_id)')
+      .eq('webinar_id', w.id),
+    webinarJoinLink(w.id)
+  ]);
+  if (error) { box.remove(); return; } // migration 010 pas encore exécutée
+  const list = (rows || []).map(r => r.apprenant).filter(Boolean)
+    .sort((a, b) => apprenantName(a).localeCompare(apprenantName(b), 'fr'));
+  const open = ['planifie', 'en_direct'].includes(w.status);
+  box.innerHTML = `
+    <div class="row spread" style="margin-bottom:8px">
+      <h2 style="margin:0">👥 Invités (${list.length})</h2>
+      <div class="row">
+        ${open ? '<button class="btn primary sm" id="inv-share">🔗 Partager le lien</button>' : ''}
+        ${open ? `<a class="btn sm" href="#/webinaires/${w.id}/reprogrammer">＋ Inviter</a>` : ''}
+      </div>
+    </div>
+    <p class="small muted" style="margin-bottom:8px">🧑‍🏫 Animateur (d’office) : <strong>${esc(w.encadreur?.full_name || '')}</strong></p>
+    ${list.length ? `<div class="list">${list.map(a => {
+      const l = link ? shareLinks(w, link, a) : null;
+      return `
+        <div class="list-item">
+          <div class="avatar sm">${esc(initials(`${a.prenom} ${a.nom}`))}</div>
+          <div class="grow"><strong>${esc(apprenantName(a))}</strong>
+            <div class="muted small">${[apprenantGroup(a), a.telephone && `📞 ${a.telephone}`, a.email].filter(Boolean).map(esc).join(' · ')}</div></div>
+          ${a.profile_id ? '<span class="badge ok" title="A un compte : inscrit d’office">✅ Inscrit</span>' : ''}
+          ${l && open ? `<span class="row" style="gap:4px">
+            ${a.telephone ? `<a class="btn sm wa" href="${l.whatsapp}" target="_blank" rel="noopener" title="Envoyer le lien par WhatsApp">🟢</a>
+              <a class="btn sm" href="${l.sms}" title="Envoyer le lien par SMS">✉️</a>` : ''}
+            ${a.email ? `<a class="btn sm" href="${l.email}" title="Envoyer le lien par e-mail">📧</a>` : ''}
+          </span>` : ''}
+        </div>`;
+    }).join('')}</div>`
+      : `<p class="muted">Aucun apprenant invité. ${open ? 'Cliquez sur « ＋ Inviter » pour en choisir dans la liste, ou partagez simplement le lien.' : ''}</p>`}`;
+  box.querySelector('#inv-share')?.addEventListener('click', () => shareLinkDialog(w));
+}
+
+// ---------------------------------------------------------------------
+// Entrée par le lien unique (#/rejoindre/<code>)
+// ---------------------------------------------------------------------
+const JOIN_NAME_KEY = 'webinaire.joinName';
+
+async function renderJoin(token, code) {
+  app.innerHTML = `<div class="auth-panel"><div class="card auth-card stack" id="join-card">${loading()}</div></div>`;
+  const { data, error } = await sb.rpc('webinar_by_code', { c: code });
+  if (isStale(token)) return;
+  const card = document.getElementById('join-card');
+  const w = data?.[0];
+  if (error || !w) {
+    card.innerHTML = `<h2>Lien invalide</h2><p class="muted">Ce lien de webinaire n’existe pas ou a été remplacé par un nouveau.
+      Demandez le lien à jour à l’organisateur.</p>`;
+    return;
+  }
+  if (['termine', 'annule'].includes(w.status)) {
+    card.innerHTML = `<h2>${esc(w.title)}</h2><p class="notice warn">Ce webinaire est ${w.status === 'termine' ? 'terminé' : 'annulé'}.</p>`;
+    return;
+  }
+  let saved = '';
+  try { saved = localStorage.getItem(JOIN_NAME_KEY) || ''; } catch (e) { /* stockage indisponible */ }
+  card.innerHTML = `
+    <div class="brand" style="margin-bottom:4px"><span class="logo">🎥</span>WEBINAIRE</div>
+    <h2 style="margin:0">${esc(w.title)}</h2>
+    <p class="muted">${esc(fmtDate(w.starts_at))} · ${esc(fmtTime(w.starts_at))} – ${esc(fmtTime(w.ends_at))}
+      ${w.animateur ? `<br>Animé par ${esc(w.animateur)}` : ''}</p>
+    ${w.status === 'en_direct' ? '<p><span class="badge live">En direct</span></p>' : ''}
+    <form id="join-form" class="stack">
+      <label>Votre nom (prénom et nom)<input name="name" required minlength="2" maxlength="120" autocomplete="name" value="${esc(saved)}" placeholder="Ex. Awa Ndiaye"></label>
+      <button class="btn primary" type="submit">Entrer dans le webinaire</button>
+    </form>
+    <p class="small muted">Pas besoin de mot de passe. <a href="#" id="join-login">J’ai un compte : me connecter</a></p>`;
+  const form = document.getElementById('join-form');
+  if (!saved) form.name.focus();
+  document.getElementById('join-login').addEventListener('click', e => {
+    e.preventDefault();
+    try { sessionStorage.setItem(NEXT_KEY, `#/rejoindre/${code}`); } catch (err) { /* stockage indisponible */ }
+    renderAuth('login');
+  });
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    const name = form.name.value.trim().replace(/\s+/g, ' ');
+    if (name.length < 2) return toast('Indiquez votre nom.', 'error');
+    const btn = form.querySelector('[type=submit]');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Connexion…';
+    try { localStorage.setItem(JOIN_NAME_KEY, name); } catch (err) { /* stockage indisponible */ }
+    // Connexion « invitée » (anonyme) : le reste se fait dans joinWithLink une fois connecté.
+    const { error: err } = await sb.auth.signInAnonymously({ options: { data: { full_name: name } } });
+    if (err) {
+      btn.disabled = false;
+      btn.textContent = 'Entrer dans le webinaire';
+      return toast(/anonymous/i.test(err.message)
+        ? 'Les connexions invitées ne sont pas encore activées. L’administrateur doit les activer dans Supabase (Authentication → « Allow anonymous sign-ins »).'
+        : translateError(err), 'error');
+    }
+  });
+}
+
+async function joinWithLink(token, code) {
+  renderBareShell();
+  const view = document.getElementById('view');
+  view.innerHTML = loading('Entrée dans le webinaire…');
+  let name = null;
+  try { name = localStorage.getItem(JOIN_NAME_KEY); } catch (e) { /* stockage indisponible */ }
+  const { data: id, error } = await sb.rpc('join_by_code', { c: code, display_name: name });
+  if (isStale(token)) return;
+  if (error) {
+    view.innerHTML = `<div class="card" style="max-width:520px;margin:40px auto">
+      <h2>Impossible d’entrer</h2><p class="notice danger">${esc(translateError(error))}</p>
+      <a class="btn" href="#/">Aller à l’accueil</a></div>`;
+    return;
+  }
+  profile = null; // nom éventuellement complété : relu à la prochaine page
+  location.hash = `#/salle/${id}`;
+}
+
 function renderShell(hash) {
   const links = [
     ['#/', '🏠', 'Tableau de bord'],
@@ -352,7 +563,7 @@ function renderShell(hash) {
     ['#/bibliotheque', '📚', 'Bibliothèque']
   ];
   if (profile.role === 'apprenant') links.splice(2, 0, ['#/mes-inscriptions', '📝', 'Mes inscriptions']);
-  if (profile.role === 'admin') links.push(['#/encadreurs', '🧑‍🏫', 'Encadreurs'], ['#/utilisateurs', '👥', 'Utilisateurs']);
+  if (profile.role === 'admin') links.push(['#/utilisateurs', '👥', 'Utilisateurs']);
   links.push(['#/profil', '⚙️', 'Mon profil']);
 
   const active = href => (href === '#/' ? hash === '#/' : hash.startsWith(href)) ||
@@ -1219,6 +1430,20 @@ async function viewWebinarForm(view, token, id) {
     w = data;
   }
 
+  // Participants : animateur (ajouté d'office) et apprenants invités (migration 010).
+  const admin = profile.role === 'admin';
+  const [{ data: learners, error: learnersError }, { data: hosts }, { data: invited }] = await Promise.all([
+    sb.from('apprenants').select('id, prenom, nom, filiere, annee, telephone, email').order('nom').order('prenom'),
+    admin ? sb.from('profiles').select('id, full_name, email, role').in('role', ['admin', 'encadreur']).eq('status', 'approuve').order('full_name')
+      : Promise.resolve({ data: [] }),
+    id ? sb.from('webinar_invites').select('apprenant_id').eq('webinar_id', id) : Promise.resolve({ data: [] })
+  ]);
+  if (isStale(token)) return;
+  const inviteReady = !learnersError;
+  const chosen = new Set((invited || []).map(x => x.apprenant_id));
+  const initialInvites = new Set(chosen);
+  const hostId = w ? w.encadreur_id : profile.id;
+
   const start = w ? new Date(w.starts_at) : (() => {
     const d = new Date(Date.now() + 24 * 3600 * 1000);
     d.setMinutes(0, 0, 0);
@@ -1243,6 +1468,23 @@ async function viewWebinarForm(view, token, id) {
         <label>Durée (minutes)<input type="number" name="duration" min="5" max="720" step="5" required value="${w ? w.duration_minutes : 60}"></label>
         <label>Heure de fin<input type="time" name="end" required></label>
       </div>
+      <fieldset class="invite-box">
+        <legend>👥 Participants</legend>
+        ${admin
+          ? `<label>Animateur (encadreur ajouté d’office)<select name="host">${(hosts || []).map(h =>
+              `<option value="${h.id}" ${h.id === hostId ? 'selected' : ''}>${esc(h.full_name || h.email)}${h.role === 'admin' ? ' (administrateur)' : ''}${h.id === profile.id ? ' — vous' : ''}</option>`).join('')}</select></label>`
+          : `<p class="small"><strong>Animateur (ajouté d’office) :</strong> 🧑‍🏫 ${esc(profile.full_name || 'vous')}</p>`}
+        ${inviteReady ? `
+          <label>Inviter des apprenants</label>
+          <div class="invite-pickers">
+            <select id="inv-pick" aria-label="Choisir un apprenant"></select>
+            <select id="inv-group" aria-label="Inviter toute une filière"></select>
+          </div>
+          <div id="inv-chips" class="inv-chips"></div>
+          <p class="hint">Après l’enregistrement, envoyez le lien du webinaire aux invités (WhatsApp, SMS ou e-mail) :
+            un clic suffit pour entrer, sans mot de passe ni salle d’attente.</p>`
+          : `<p class="hint">Pour inviter des apprenants, exécutez d’abord <code>supabase/010_apprenants_invitations_lien.sql</code> dans Supabase.</p>`}
+      </fieldset>
       <p class="notice" id="wf-summary"></p>
       <div class="actions">
         <a class="btn" href="${id ? `#/webinaires/${id}` : '#/webinaires'}">Annuler</a>
@@ -1283,6 +1525,40 @@ async function viewWebinarForm(view, token, id) {
   form.end.addEventListener('change', syncDuration);
   syncEnd();
 
+  // Liste déroulante des apprenants (par filière et année) et ajout d'une filière entière.
+  const groupOf = a => [a.filiere, a.annee].filter(Boolean).join(' · ') || 'Sans filière';
+  const drawInvites = () => {
+    if (!inviteReady) return;
+    const rest = learners.filter(a => !chosen.has(a.id));
+    const groups = new Map();
+    rest.forEach(a => { if (!groups.has(groupOf(a))) groups.set(groupOf(a), []); groups.get(groupOf(a)).push(a); });
+    const pick = view.querySelector('#inv-pick');
+    pick.innerHTML = `<option value="">${learners.length ? (rest.length ? '＋ Ajouter un apprenant…' : 'Tous les apprenants sont invités')
+      : 'Aucun apprenant enregistré (Utilisateurs → Apprenants)'}</option>` +
+      [...groups.entries()].sort((x, y) => x[0].localeCompare(y[0], 'fr', { numeric: true })).map(([g, list]) =>
+        `<optgroup label="${esc(g)}">${list.map(a => `<option value="${a.id}">${esc(apprenantName(a))}</option>`).join('')}</optgroup>`).join('');
+    const allGroups = [...new Set(learners.map(groupOf))].sort((x, y) => x.localeCompare(y, 'fr', { numeric: true }));
+    view.querySelector('#inv-group').innerHTML = '<option value="">＋ Toute une filière…</option>' +
+      allGroups.map(g => `<option value="${esc(g)}">${esc(g)} (${learners.filter(a => groupOf(a) === g).length})</option>`).join('');
+    const chips = view.querySelector('#inv-chips');
+    const list = learners.filter(a => chosen.has(a.id));
+    chips.innerHTML = list.length
+      ? `<span class="small muted">${list.length} invité${list.length > 1 ? 's' : ''} :</span>` + list.map(a =>
+        `<span class="inv-chip">${esc(apprenantName(a))}<button type="button" data-unchoose="${a.id}" aria-label="Retirer ${esc(apprenantName(a))}">✕</button></span>`).join('') +
+        (list.length > 1 ? '<button type="button" class="btn ghost sm" id="inv-clear">Tout retirer</button>' : '')
+      : '<span class="small muted">Aucun apprenant invité pour l’instant.</span>';
+    chips.querySelectorAll('[data-unchoose]').forEach(b => b.addEventListener('click', () => { chosen.delete(b.dataset.unchoose); drawInvites(); }));
+    chips.querySelector('#inv-clear')?.addEventListener('click', () => { chosen.clear(); drawInvites(); });
+  };
+  if (inviteReady) {
+    view.querySelector('#inv-pick').addEventListener('change', e => { if (e.target.value) chosen.add(e.target.value); drawInvites(); });
+    view.querySelector('#inv-group').addEventListener('change', e => {
+      learners.filter(a => groupOf(a) === e.target.value).forEach(a => chosen.add(a.id));
+      drawInvites();
+    });
+    drawInvites();
+  }
+
   form.addEventListener('submit', async e => {
     e.preventDefault();
     const s = startDate();
@@ -1298,14 +1574,30 @@ async function viewWebinarForm(view, token, id) {
       starts_at: s.toISOString(),
       duration_minutes: duration
     };
+    if (admin && form.host?.value) payload.encadreur_id = form.host.value;
     const btn = form.querySelector('[type=submit]');
     btn.disabled = true;
     const { data, error } = w
       ? await sb.from('webinars').update(payload).eq('id', w.id).select().single()
-      : await sb.from('webinars').insert({ ...payload, encadreur_id: profile.id }).select().single();
+      : await sb.from('webinars').insert({ encadreur_id: profile.id, ...payload }).select().single();
+    if (error) { btn.disabled = false; return fail(error); }
+    // Invitations : ajoute les nouveaux invités, retire ceux qu'on a enlevés.
+    if (inviteReady) {
+      const added = [...chosen].filter(x => !initialInvites.has(x));
+      const removed = [...initialInvites].filter(x => !chosen.has(x));
+      if (added.length) {
+        const { error: e1 } = await sb.from('webinar_invites').insert(added.map(a => ({ webinar_id: data.id, apprenant_id: a })));
+        if (e1) fail(e1);
+      }
+      if (removed.length) {
+        const { error: e2 } = await sb.from('webinar_invites').delete().eq('webinar_id', data.id).in('apprenant_id', removed);
+        if (e2) fail(e2);
+      }
+    }
     btn.disabled = false;
-    if (error) return fail(error);
     toast(w ? 'Webinaire mis à jour ✓' : 'Webinaire créé ✓', 'success');
+    // Juste après la création : proposer tout de suite d'envoyer le lien aux invités.
+    if (!w) { try { sessionStorage.setItem('webinaire.share', data.id); } catch (err) { /* stockage indisponible */ } }
     location.hash = `#/webinaires/${data.id}`;
   });
 }
@@ -1334,12 +1626,12 @@ async function viewWebinarDetail(view, token, id) {
     if (w.status === 'planifie') {
       actions = `
         <a class="btn live" href="#/salle/${id}">🎬 Ouvrir la salle</a>
-        <button class="btn" id="copy-link-w">🔗 Copier le lien</button>
+        <button class="btn primary" id="copy-link-w">🔗 Partager le lien</button>
         <a class="btn" href="#/webinaires/${id}/reprogrammer">🗓️ Reprogrammer</a>
         <button class="btn danger" id="cancel-w">Annuler le webinaire</button>`;
     } else if (w.status === 'en_direct') {
       actions = `<a class="btn live" href="#/salle/${id}">Rejoindre la salle</a>
-        <button class="btn" id="copy-link-w">🔗 Copier le lien</button>`;
+        <button class="btn primary" id="copy-link-w">🔗 Partager le lien</button>`;
     } else if (w.status === 'termine') {
       actions = `<button class="btn live" id="reopen-w">🔓 Rouvrir le direct</button>
         <a class="btn" href="#/webinaires/${id}/reprogrammer">🗓️ Reprogrammer</a>`;
@@ -1395,9 +1687,15 @@ async function viewWebinarDetail(view, token, id) {
       ${resources.length ? `<div class="list">${resources.map(r => resourceRow(r, manage)).join('')}</div>` :
         '<p class="muted">Aucune ressource associée. Ajoutez des supports de cours pour les apprenants.</p>'}
     </div>` : ''}
+    ${manage ? '<div class="card" id="invites"></div>' : ''}
     ${manage ? '<div class="card" id="manage">' + loading() + '</div>' : ''}`;
 
   bindResourceButtons(view);
+  if (manage) renderInvitesCard(view.querySelector('#invites'), w);
+  // Webinaire tout juste créé : on propose directement d'envoyer le lien.
+  let justCreated = null;
+  try { justCreated = sessionStorage.getItem('webinaire.share'); sessionStorage.removeItem('webinaire.share'); } catch (e) { /* stockage indisponible */ }
+  if (manage && justCreated === id && ['planifie', 'en_direct'].includes(w.status)) shareLinkDialog(w, { created: true });
   view.querySelectorAll('[data-unlink]').forEach(b => b.addEventListener('click', async () => {
     const { error: err } = await sb.from('webinar_resources').delete().eq('webinar_id', id).eq('resource_id', b.dataset.unlink);
     if (err) return fail(err);
@@ -1422,7 +1720,7 @@ async function viewWebinarDetail(view, token, id) {
     route();
   });
   on('#reopen-w', () => reopenWebinar(w));
-  on('#copy-link-w', () => copyRoomLink(id));
+  on('#copy-link-w', () => shareLinkDialog(w));
   on('#restore-w', async () => {
     const { error: err } = await sb.from('webinars').update({ status: 'planifie', cancel_reason: null }).eq('id', id);
     if (err) return fail(err);
@@ -3169,7 +3467,7 @@ function renderRoomView() {
         <div class="stage-tools">
           <button class="btn sm" id="zoom-wide">${room.wide ? '↙ Réduire' : '↗ Agrandir'}</button>
           <button class="btn sm" id="zoom-full">⛶ Plein écran</button>
-          ${host ? '<button class="btn sm" id="copy-link">🔗 Copier le lien de la salle</button>' : ''}
+          ${host ? '<button class="btn sm" id="copy-link">🔗 Partager le lien</button>' : ''}
         </div>
         ${host ? stageToolbar(w) : ''}
         <div id="projection-chip"></div>
@@ -3219,7 +3517,7 @@ function bindZoomButtons(view, w) {
     else toast('Le plein écran n’est pas disponible sur cet appareil : utilisez « Agrandir ».');
   });
   const copy = view.querySelector('#copy-link');
-  if (copy) copy.addEventListener('click', () => copyRoomLink(w.id));
+  if (copy) copy.addEventListener('click', () => shareLinkDialog(w));
 }
 
 function stageToolbar(w) {
@@ -4123,6 +4421,166 @@ async function uploadDialog(onDone, presetWebinarId = '') {
 // ligne. « Accès à la plateforme » lui donne le rôle encadreur (migration 009).
 // =====================================================================
 
+// En-tête commun de la rubrique Utilisateurs : onglets Comptes / Encadreurs / Apprenants.
+function usersHead(active, subtitle, action = '') {
+  const tabs = [
+    ['comptes', '#/utilisateurs', '🔐 Comptes'],
+    ['encadreurs', '#/utilisateurs/encadreurs', '🧑‍🏫 Encadreurs'],
+    ['apprenants', '#/utilisateurs/apprenants', '🎓 Apprenants']
+  ];
+  return `
+    <div class="page-head">
+      <div><h1>Utilisateurs</h1><p class="muted">${esc(subtitle)}</p></div>
+      ${action}
+    </div>
+    <nav class="tabs user-tabs">${tabs.map(([k, href, label]) =>
+      `<a href="${href}" class="${k === active ? 'active' : ''}">${label}</a>`).join('')}</nav>`;
+}
+
+// =====================================================================
+// Apprenants (administrateur) : nom, prénom, filière, année, téléphone,
+// e-mail, adresse. Les fiches servent aux invitations des webinaires
+// (migration 010) ; si l'apprenant a un compte avec le même e-mail, la fiche
+// y est reliée et il est inscrit d'office aux webinaires où il est invité.
+// =====================================================================
+
+const ANNEES = ['1ère année', '2e année', '3e année', '4e année', '5e année'];
+
+function apprenantName(a) {
+  return `${a.prenom} ${(a.nom || '').toUpperCase()}`.trim();
+}
+
+function apprenantGroup(a) {
+  return [a.filiere, a.annee].filter(Boolean).join(' · ');
+}
+
+async function viewApprenants(view, token) {
+  const { data: list, error } = await sb.from('apprenants')
+    .select('*, profile:profiles!apprenants_profile_id_fkey(id, role, status)').order('nom').order('prenom');
+  if (isStale(token)) return;
+  if (error) {
+    return (view.innerHTML = `${usersHead('apprenants', '')}<div class="notice danger">${esc(translateError(error))}
+      <p class="small" style="margin-top:8px">Si la rubrique est nouvelle : exécutez <code>supabase/010_apprenants_invitations_lien.sql</code> dans Supabase → SQL Editor.</p></div>`);
+  }
+  let search = '';
+  let group = '';
+  const groups = [...new Set(list.map(apprenantGroup).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'fr', { numeric: true }));
+  view.innerHTML = `
+    ${usersHead('apprenants', 'Fiches des apprenants : à inviter aux webinaires.',
+      '<a class="btn primary" href="#/utilisateurs/apprenants/nouveau">＋ Nouvel apprenant</a>')}
+    <div class="toolbar">
+      <input class="search" id="app-search" type="search" placeholder="Rechercher (nom, téléphone, e-mail)…">
+      ${groups.length ? `<select id="app-group" style="width:auto;margin:0" aria-label="Filière et année">
+        <option value="">Toutes les filières</option>${groups.map(g => `<option>${esc(g)}</option>`).join('')}</select>` : ''}
+    </div>
+    <div id="app-results"></div>`;
+
+  const draw = () => {
+    const shown = list.filter(a => (!group || apprenantGroup(a) === group) && (!search ||
+      `${a.prenom} ${a.nom} ${a.telephone} ${a.email} ${a.filiere}`.toLowerCase().includes(search)));
+    const box = view.querySelector('#app-results');
+    if (!shown.length) {
+      box.innerHTML = `<div class="card">${emptyState('🎓', list.length ? 'Aucun apprenant ne correspond.' : 'Aucun apprenant pour le moment.',
+        list.length ? '' : '<a class="btn primary" href="#/utilisateurs/apprenants/nouveau">＋ Créer la première fiche</a>')}</div>`;
+      return;
+    }
+    box.innerHTML = `<div class="card list">${shown.map(a => `
+      <a class="enc-row" href="#/utilisateurs/apprenants/${a.id}">
+        <span class="avatar">${esc(initials(`${a.prenom} ${a.nom}`))}</span>
+        <span class="enc-main">
+          <strong>${esc(apprenantName(a))}</strong>
+          <span class="muted small">${[a.telephone && `📞 ${esc(a.telephone)}`, a.email && `✉️ ${esc(a.email)}`].filter(Boolean).join(' · ') || '—'}</span>
+        </span>
+        <span class="enc-tags">
+          ${apprenantGroup(a) ? `<span class="badge">🎓 ${esc(apprenantGroup(a))}</span>` : ''}
+          ${a.profile ? '<span class="badge ok">✅ Compte</span>' : ''}
+        </span>
+      </a>`).join('')}</div>
+      <p class="muted small" style="margin-top:8px">${shown.length} apprenant${shown.length > 1 ? 's' : ''}</p>`;
+  };
+  view.querySelector('#app-search').addEventListener('input', e => { search = e.target.value.trim().toLowerCase(); draw(); });
+  view.querySelector('#app-group')?.addEventListener('change', e => { group = e.target.value; draw(); });
+  draw();
+}
+
+async function viewApprenant(view, token, id) {
+  const [{ data: a, error }, { data: all }] = await Promise.all([
+    id ? sb.from('apprenants').select('*, profile:profiles!apprenants_profile_id_fkey(id, role, status)').eq('id', id).maybeSingle()
+      : Promise.resolve({ data: null, error: null }),
+    sb.from('apprenants').select('filiere')
+  ]);
+  if (isStale(token)) return;
+  if (error) return (view.innerHTML = `<div class="notice danger">${esc(translateError(error))}</div>`);
+  if (id && !a) return (view.innerHTML = '<div class="notice danger">Fiche introuvable.</div>');
+  const filieres = [...new Set((all || []).map(x => x.filiere).filter(Boolean))].sort((x, y) => x.localeCompare(y, 'fr'));
+
+  view.innerHTML = `
+    <a class="back" href="#/utilisateurs/apprenants">← Apprenants</a>
+    <div class="page-head"><div>
+      <h1>${a ? esc(apprenantName(a)) : 'Nouvel apprenant'}</h1>
+      ${a ? `<p class="muted">${a.profile ? '<span class="badge ok">✅ Compte relié</span>'
+        : '<span class="badge">Pas de compte : il entre par le lien du webinaire</span>'}</p>` : ''}
+    </div></div>
+    <form class="card" id="app-form" novalidate style="max-width:760px">
+      <div class="form-grid">
+        <label>Prénom<input name="prenom" required maxlength="80" autocomplete="given-name" value="${esc(a?.prenom || '')}"></label>
+        <label>Nom<input name="nom" required maxlength="80" autocomplete="family-name" value="${esc(a?.nom || '')}"></label>
+        <label>Filière<input name="filiere" maxlength="120" list="filieres" placeholder="Ex. Radiologie" value="${esc(a?.filiere || '')}"></label>
+        <label>Année<input name="annee" maxlength="40" list="annees" placeholder="Ex. 1ère année" value="${esc(a?.annee || '')}"></label>
+        <label>Téléphone<input name="telephone" type="tel" maxlength="40" autocomplete="tel" placeholder="77 123 45 67" value="${esc(a?.telephone || '')}"></label>
+        <label>E-mail (facultatif)<input name="email" type="email" maxlength="160" autocomplete="email" value="${esc(a?.email || '')}"></label>
+      </div>
+      <label style="margin-top:12px">Adresse<textarea name="adresse" rows="2" maxlength="300" autocomplete="street-address">${esc(a?.adresse || '')}</textarea></label>
+      <datalist id="filieres">${filieres.map(f => `<option value="${esc(f)}">`).join('')}</datalist>
+      <datalist id="annees">${ANNEES.map(x => `<option value="${esc(x)}">`).join('')}</datalist>
+      <p class="hint">Avec un e-mail, l’apprenant qui crée un compte est relié à sa fiche et inscrit d’office aux webinaires où il est invité.
+        Sans compte, il entre par le lien du webinaire en donnant simplement son nom.</p>
+      <div class="actions">
+        ${a ? '<button class="btn danger ghost" type="button" id="app-delete">🗑 Supprimer la fiche</button>' : '<a class="btn" href="#/utilisateurs/apprenants">Annuler</a>'}
+        ${a ? '' : '<button class="btn" type="submit" data-again="1">Créer et ajouter un autre</button>'}
+        <button class="btn primary" type="submit">${a ? 'Enregistrer' : 'Créer la fiche'}</button>
+      </div>
+    </form>`;
+
+  const form = view.querySelector('#app-form');
+  form.addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const again = ev.submitter?.dataset.again === '1';
+    const values = {
+      prenom: form.prenom.value.trim(),
+      nom: form.nom.value.trim(),
+      filiere: form.filiere.value.trim(),
+      annee: form.annee.value.trim(),
+      telephone: form.telephone.value.trim(),
+      email: form.email.value.trim().toLowerCase(),
+      adresse: form.adresse.value.trim()
+    };
+    if (!values.prenom || !values.nom) return toast('Le prénom et le nom sont obligatoires.', 'error');
+    if (values.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(values.email)) return toast('Adresse e-mail invalide.', 'error');
+    form.querySelectorAll('[type=submit]').forEach(b => { b.disabled = true; });
+    const query = a ? sb.from('apprenants').update(values).eq('id', a.id) : sb.from('apprenants').insert(values);
+    const { data, error: err } = await query.select('id').single();
+    form.querySelectorAll('[type=submit]').forEach(b => { b.disabled = false; });
+    if (err) return fail(/duplicate|unique/i.test(err.message) ? new Error('Un apprenant avec cet e-mail existe déjà.') : err);
+    toast(a ? 'Fiche enregistrée.' : `${values.prenom} ${values.nom} ajouté(e).`, 'success');
+    if (again) {
+      // Saisie en série : on garde la filière et l'année.
+      ['prenom', 'nom', 'telephone', 'email', 'adresse'].forEach(k => { form[k].value = ''; });
+      form.prenom.focus();
+      return;
+    }
+    location.hash = a ? '#/utilisateurs/apprenants' : `#/utilisateurs/apprenants/${data.id}`;
+  });
+
+  view.querySelector('#app-delete')?.addEventListener('click', async () => {
+    if (!await confirmDialog(`Supprimer la fiche de ${apprenantName(a)} ?`, { confirmLabel: 'Supprimer', danger: true })) return;
+    const { error: err } = await sb.from('apprenants').delete().eq('id', a.id);
+    if (err) return fail(err);
+    toast('Fiche supprimée.');
+    location.hash = '#/utilisateurs/apprenants';
+  });
+}
+
 const ENCADREUR_SELECT = '*, documents:encadreur_documents(count), profile:profiles!encadreurs_profile_id_fkey(id, role, full_name)';
 
 function encadreurName(e) {
@@ -4151,13 +4609,8 @@ async function viewEncadreurs(view, token) {
   }
   let search = '';
   view.innerHTML = `
-    <div class="page-head">
-      <div>
-        <h1>Encadreurs</h1>
-        <p class="muted">Fiches des encadreurs : coordonnées et documents (CV, diplômes, attestations…).</p>
-      </div>
-      <a class="btn primary" href="#/encadreurs/nouveau">＋ Nouvel encadreur</a>
-    </div>
+    ${usersHead('encadreurs', 'Fiches des encadreurs : coordonnées et documents (CV, diplômes, attestations…).',
+      '<a class="btn primary" href="#/utilisateurs/encadreurs/nouveau">＋ Nouvel encadreur</a>')}
     <div class="toolbar"><input class="search" id="enc-search" type="search" placeholder="Rechercher (nom, téléphone, e-mail)…"></div>
     <div id="enc-results"></div>`;
 
@@ -4167,13 +4620,13 @@ async function viewEncadreurs(view, token) {
     const box = view.querySelector('#enc-results');
     if (!shown.length) {
       box.innerHTML = `<div class="card">${emptyState('🧑‍🏫', list.length ? 'Aucun encadreur ne correspond.'
-        : 'Aucun encadreur pour le moment.', list.length ? '' : '<a class="btn primary" href="#/encadreurs/nouveau">＋ Créer la première fiche</a>')}</div>`;
+        : 'Aucun encadreur pour le moment.', list.length ? '' : '<a class="btn primary" href="#/utilisateurs/encadreurs/nouveau">＋ Créer la première fiche</a>')}</div>`;
       return;
     }
     box.innerHTML = `<div class="card list">${shown.map(e => {
       const docs = e.documents?.[0]?.count || 0;
       return `
-        <a class="enc-row" href="#/encadreurs/${e.id}">
+        <a class="enc-row" href="#/utilisateurs/encadreurs/${e.id}">
           <span class="avatar">${esc(initials(`${e.prenom} ${e.nom}`))}</span>
           <span class="enc-main">
             <strong>${esc(encadreurName(e))}</strong>
@@ -4207,7 +4660,7 @@ async function viewEncadreur(view, token, id) {
   }
 
   view.innerHTML = `
-    <a class="back" href="#/encadreurs">← Encadreurs</a>
+    <a class="back" href="#/utilisateurs/encadreurs">← Encadreurs</a>
     <div class="page-head">
       <div>
         <h1>${e ? esc(encadreurName(e)) : 'Nouvel encadreur'}</h1>
@@ -4234,7 +4687,7 @@ async function viewEncadreur(view, token, id) {
           <input type="file" name="files" multiple accept=".pdf,.doc,.docx,.odt,.txt,image/*">
           <div id="enc-picked" class="small muted" style="margin-top:6px"></div>`}
         <div class="actions">
-          ${e ? '<button class="btn danger ghost" type="button" id="enc-delete">🗑 Supprimer la fiche</button>' : '<a class="btn" href="#/encadreurs">Annuler</a>'}
+          ${e ? '<button class="btn danger ghost" type="button" id="enc-delete">🗑 Supprimer la fiche</button>' : '<a class="btn" href="#/utilisateurs/encadreurs">Annuler</a>'}
           <button class="btn primary" type="submit">${e ? 'Enregistrer' : 'Créer la fiche'}</button>
         </div>
       </form>
@@ -4284,7 +4737,7 @@ async function viewEncadreur(view, token, id) {
     }
     toast(e ? 'Fiche enregistrée.' : 'Encadreur créé.', 'success');
     if (e) viewEncadreur(view, ++renderToken, e.id);
-    else location.hash = `#/encadreurs/${data.id}`;
+    else location.hash = `#/utilisateurs/encadreurs/${data.id}`;
   });
 
   if (!e) return;
@@ -4296,7 +4749,7 @@ async function viewEncadreur(view, token, id) {
     const { error } = await sb.from('encadreurs').delete().eq('id', e.id);
     if (error) return fail(error);
     toast('Fiche supprimée. Son compte éventuel n’est pas modifié (voir « Utilisateurs »).');
-    location.hash = '#/encadreurs';
+    location.hash = '#/utilisateurs/encadreurs';
   });
 
   view.querySelector('#enc-add').addEventListener('click', () => {
@@ -4423,9 +4876,7 @@ async function viewAdmin(view, token) {
   ];
 
   view.innerHTML = `
-    <div class="page-head">
-      <div><h1>Utilisateurs</h1><p class="muted">Créez les encadreurs et gérez les accès.</p></div>
-    </div>
+    ${usersHead('comptes', 'Comptes de connexion : validation, rôles et accès.')}
     ${pwdList.length ? `<div class="card" style="margin-bottom:16px">
       <h2>🔑 Mots de passe oubliés (${pwdList.length})</h2>
       <div class="list">${pwdList.map(r => `
